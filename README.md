@@ -4,7 +4,7 @@ EmpathyMachine is a Rust-based HTTP/HTTPS proxy designed to block trackers and a
 
 Unlike DNS-only solutions such as Pi-hole or AdGuard Home, EmpathyMachine operates at the HTTP layer as well, allowing on-the-fly content rewrites, TLS interception for deeper inspection, and per-request decisions informed by both DNS and application data. It coexists with traditional network blockers like the excellent Little Snitch. 
 
-Use it to streamline and quiet your personal web experience and even rewrite web page sections or common patterns on the fly, even replace mindless jargon like "utilize" with "use". 
+Use it to streamline and quiet your personal web experience by removing or rewriting entire web page sections or common patterns on the fly, even replace mindless jargon like "utilize" with "use". 
 
 ## Responsible Use
 
@@ -98,7 +98,17 @@ Environment variables:
 - `EMPATHYMACHINE_CONFIG` – Path to an alternative configuration file.
 - `EMPATHYMACHINE_BIND` – Override listen address (e.g. `0.0.0.0:8080`).
 
-Remember to restart the proxy after editing `config.yaml` so changes take effect.
+Remember to restart the proxy each time after editing `config.yaml` for changes to take effect.
+
+### Rewrite Actions Explained
+
+EmpathyMachine applies rewrite rules in three passes whenever an intercepted response is HTML:
+
+1. **remove** – Treat entries as CSS selectors; any matching elements are stripped from the document.@src/rewriter.rs#137-155@src/rewriter.rs#194-203
+2. **replace** – Perform plain-text substitutions across the HTML body using the configured `find` → `replace` pairs.@src/rewriter.rs#137-161@src/rewriter.rs#205-212
+3. **css** – Inject a `<style data-empathymachine>…</style>` block containing the listed rules so you can hide or restyle content non-destructively.@src/rewriter.rs#163-177@src/rewriter.rs#237-267
+
+Global rules run for every host, while host-specific sections under `rewrites.hosts` are merged in before the passes above, allowing per-domain tailoring on top of site-wide defaults.@src/rewriter.rs#194-224
 
 ## DNS Sinkhole Usage
 
@@ -151,4 +161,6 @@ EmpathyMachine is provided "as is" without warranties or guarantees. You are res
 
 ## Why 'EmpathyMachine'?
 
-The 'Empathy Machine' is a fixture in Phillip K. Dick's 'Do Androids Dream of Electric Sheep?' - a device that allows users of the dystopian world to “fuse” with others through shared experience. The participant grips two handles and is instantly connected to a collective hallucination where the user is made to feel empathy collectively. The empathy box serves as both a moral barometer and a coping mechanism in a world where life (and authentic emotion) is scarce.
+<img src="https://upload.wikimedia.org/wikipedia/commons/e/ee/DoAndroidsDream.png" alt="Do Androids Dream of Electric Sheep? cover" width="160" align="right" />
+
+The 'Empathy Machine' is a fixture in Phillip K. Dick's 'Do Androids Dream of Electric Sheep?' - a device that allows users of the dystopian world to “fuse” with others through shared experience. The participant grips two handles and is instantly connected to a collective hallucination where the user is made to feel empathy collectively. The empathy box serves as both a moral barometer and a coping mechanism in a world where real life (and authentic emotion) is scarce.
