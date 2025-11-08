@@ -4,6 +4,7 @@
 blocklists/*
 !blocklists/custom.sample.txt
 Cargo.lock
+PLAN.md
 
 # operation artifacts that should be private
 config.yaml
