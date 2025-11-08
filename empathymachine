@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}" && pwd)"
+CARGO_MANIFEST="${PROJECT_ROOT}/Cargo.toml"
+
+cd "${PROJECT_ROOT}" || {
+    echo "error: failed to change directory to ${PROJECT_ROOT}" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: empathymachine <command> [options]
+
+Commands:
+  start [--update-lists]    Run the proxy (optionally refresh blocklists first)
+  refresh-blocklists        Fetch remote blocklists and exit
+  dump-ca                   Print the root CA certificate PEM to stdout
+
+Any additional arguments after "--" are passed through to `cargo run`.
+EOF
+}
+
+require_cargo() {
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "error: cargo is required to run empathymachine" >&2
+        exit 1
+    fi
+}
+
+run_cargo() {
+    require_cargo
+    local cargo_cmd
+    cargo_cmd="${EMPATHYMACHINE_CARGO_CMD:-cargo}"
+    "${cargo_cmd}" run --manifest-path "${CARGO_MANIFEST}" -- "$@"
+}
+
+if [[ $# -lt 1 ]]; then
+    usage >&2
+    exit 1
+fi
+
+COMMAND=$1
+shift
+
+case "${COMMAND}" in
+    start)
+        UPDATE_LISTS=false
+        declare -a PASS_ARGS=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --update-lists)
+                    UPDATE_LISTS=true
+                    shift
+                    ;;
+                --)
+                    shift
+                    PASS_ARGS+=("$@")
+                    break
+                    ;;
+                *)
+                    PASS_ARGS+=("$1")
+                    shift
+                    ;;
+            esac
+        done
+
+        if [[ "${UPDATE_LISTS}" == true ]]; then
+            run_cargo --refresh-blocklists
+        fi
+
+        if [[ ${#PASS_ARGS[@]} -gt 0 ]]; then
+            run_cargo "${PASS_ARGS[@]}"
+        else
+            run_cargo
+        fi
+        ;;
+    refresh-blocklists)
+        run_cargo --refresh-blocklists "$@"
+        ;;
+    dump-ca)
+        run_cargo --dump-ca "$@"
+        ;;
+    --help|-h|help)
+        usage
+        ;;
+    *)
+        echo "error: unknown command '${COMMAND}'" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

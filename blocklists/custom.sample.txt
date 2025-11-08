@@ -1,0 +1,10 @@
+# copy this file to blocklists/custom.txt to enable local overrides
+# entries follow hosts-style format: one domain or path fragment per line
+# lines beginning with '#' are comments and ignored
+
+# example domains to block
+# ads.example.com
+# telemetry.example.org
+
+# example path fragment block (prefix with /)
+# /tracking/pixel

@@ -1,0 +1,32 @@
+# empathy machine configuration
+bind_addr: "127.0.0.1:8080"
+
+# paths to hosts-format blocklists 
+# each contributes to proxy + DNS blocking
+
+blocklists:
+  # examples of popular hosts-format lists you can download:
+  # - "blocklists/stevenblack_hosts.txt" # StevenBlack consolidated hosts
+  # - "blocklists/oisd_basic.txt"        # OISD basic blocklist (ads + trackers)
+  # - "blocklists/1hosts_pro.txt"        # 1Hosts Pro (privacy-focused)
+
+# DNS sinkhole configuration
+# choosing a custom port like :8053 doesn't interfere with host os dns for example
+dns:
+  enable: true
+  bind_addr: "127.0.0.1:8053"
+
+  # domains from the blocklists are answered with 0.0.0.0/::; others forward to these upstreams
+  upstreams:
+    - address: "1.1.1.1:853"
+      transport: tls
+      dns_name: "cloudflare-dns.com"
+
+# optional remote sources EmpathyMachine can fetch and place into blocklists/
+# each entry downloads from `url` and writes to `destination`
+sources:
+  - url: "https://raw.githubusercontent.com/StevenBlack/hosts/refs/heads/master/hosts"
+    destination: "blocklists/stevenblack_hosts.txt"
+    # etag_path and last_modified_path default beside destination but can be overridden:
+    # etag_path: "blocklists/stevenblack_hosts.txt.etag"
+    # last_modified_path: "blocklists/stevenblack_hosts.txt.last_modified"

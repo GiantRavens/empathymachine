@@ -1,0 +1,14 @@
+# build folders
+/target/
+/vendor/
+blocklists/*
+!blocklists/custom.sample.txt
+Cargo.lock
+
+# operation artifacts that should be private
+config.yaml
+certs/root_ca.key
+certs/root_ca.pem
+
+# host os annoyances
+.DS_Store
