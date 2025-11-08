@@ -75,16 +75,38 @@ tls:
   ca_dir: certs             # directory for root CA and keys
   upstream_insecure: false  # allow invalid upstream certs when true
   bypass_hosts:             # domains to tunnel without interception
-    - "gateway.icloud.com"
-    - "*.teams.microsoft.com"
+  #  - "gateway.icloud.com"
 
 dns:
   enable: true                # start the embedded trust-dns sinkhole
   bind_addr: "127.0.0.1:8053" # UDP/TCP listener for DNS clients (using 0.0.0.0:8053 for LAN clients)
   upstreams:                  # DoT/DoH/UDP/TCP resolvers EmpathyMachine forwards to
-    - address: "1.1.1.1:853"  # example when using Cloudflare's DNS service 
+    - address: "1.1.1.1:853"  # example using Cloudflare's DNS service 
       transport: tls
       dns_name: "cloudflare-dns.com"
+
+# define blocklist sources url and destination
+sources:
+  - url: "https://raw.githubusercontent.com/StevenBlack/hosts/refs/heads/master/hosts"
+    destination: "blocklists/stevenblack_hosts.txt"
+
+# define global rewrites
+rewrites:
+  remove:
+    - "iframe"
+  replace:
+    - find: "utilize"
+      replace: "use"
+  css:
+    - ".annoying-popup { display: none !important; }"
+  
+  # define per-host rewrites
+  hosts:
+    example.com:
+      remove:
+        - "#TerribleWidget"
+      css:
+        - "#AnnoyingWidget { display: none !important; }"
 ```
 
 - **`blocklists`** – Paths to hosts-format files that contain either domains or path fragments (leading `/`); comments use `#`. A starter template lives at `blocklists/custom.sample.txt`—copy it to `blocklists/custom.txt` for local overrides.
@@ -98,17 +120,17 @@ Environment variables:
 - `EMPATHYMACHINE_CONFIG` – Path to an alternative configuration file.
 - `EMPATHYMACHINE_BIND` – Override listen address (e.g. `0.0.0.0:8080`).
 
-Remember to restart the proxy each time after editing `config.yaml` for changes to take effect.
+Remember to restart the proxy after editing `config.yaml` for changes to take effect.
 
 ### Rewrite Actions Explained
 
-EmpathyMachine applies rewrite rules in three passes whenever an intercepted response is HTML:
+EmpathyMachine applies rewrite rules in three passes whenever an intercepted response is matched in HTML:
 
 1. **remove** – Treat entries as CSS selectors; any matching elements are stripped from the document.@src/rewriter.rs#137-155@src/rewriter.rs#194-203
 2. **replace** – Perform plain-text substitutions across the HTML body using the configured `find` → `replace` pairs.@src/rewriter.rs#137-161@src/rewriter.rs#205-212
 3. **css** – Inject a `<style data-empathymachine>…</style>` block containing the listed rules so you can hide or restyle content non-destructively.@src/rewriter.rs#163-177@src/rewriter.rs#237-267
 
-Global rules run for every host, while host-specific sections under `rewrites.hosts` are merged in before the passes above, allowing per-domain tailoring on top of site-wide defaults.@src/rewriter.rs#194-224
+Global rules run for *every* host, while host-specific sections under `rewrites.hosts` are merged in before the passes above, allowing per-domain tailoring on top of site-wide defaults.@src/rewriter.rs#194-224
 
 ## DNS Sinkhole Usage
 
@@ -129,7 +151,7 @@ Global rules run for every host, while host-specific sections under `rewrites.ho
    Server: 1.1.1.1
    ```
 
-   With DNS routed through EmpathyMachine, all subdomains of a listed host are also sinkholed (e.g. a `adsandtrackingareawesome.com` entry covers `www.adsandtrackingareawesome.com`, `evenmoreads.adsandtrackingareawesome.com`, etc.).
+With DNS routed through EmpathyMachine, all subdomains of a listed host are also sinkholed (e.g. a `adsandtrackingareawesome.com` entry covers `www.adsandtrackingareawesome.com`, `evenmoreads.adsandtrackingareawesome.com`, etc.).
 
 ## Operational Tips
 
@@ -147,8 +169,9 @@ Global rules run for every host, while host-specific sections under `rewrites.ho
 ## Roadmap Ideas
 
 - HTTP/2 and HTTP/3 interception support
-- Richer blocklist syntax (Adblock filters) and analytics
-- Web UI for interactive rule management
+- Richer blocklist syntax (Adblock filters)
+- Analytics suite
+- Web UI for interactive rule management or monitoring
 - Container images and systemd integration
 
 ## License

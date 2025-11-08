@@ -1,19 +1,18 @@
 # empathy machine configuration
-
 ## choose a proxy address - use 127.0.0.1 for local-only, or 0.0.0.0 to listen on all interfaces for LAN clients
 bind_addr: "127.0.0.1:8080"
 
-## define blocklists - each hosts-format file contributes domains to both the HTTP proxy and DNS sinkhole
+## Define blocklists - each hosts-format file contributes domains to both the HTTP proxy and DNS sinkhole
 ## one entry per line, comments start with '#'
 ## use blocklists/custom.txt for local overrides (never overwritten), plus any subscribed lists you refresh
 
   # examples of popular hosts-format lists you can download:
-  # - "blocklists/stevenblack_hosts.txt"        # StevenBlack consolidated hosts
-  # - "blocklists/oisd_basic.txt"              # OISD basic blocklist (ads + trackers)
-  # - "blocklists/1hosts_pro.txt"              # 1Hosts Pro (privacy-focused)
+  # - "blocklists/stevenblack_hosts.txt"  # StevenBlack consolidated hosts
+  # - "blocklists/oisd_basic.txt"         # OISD basic blocklist (ads + trackers)
+  # - "blocklists/1hosts_pro.txt"         # 1Hosts Pro (privacy-focused)
 
 blocklists:
-  - "blocklists/custom.txt"
+  # - "blocklists/custom.txt"
 
 ## define hosts that should bypass TLS interception (plain domains or wildcard prefixes like *.icloud.com)
 ## bypassed hosts are allowed through untouched, even if the DNS sinkhole is enabled
@@ -46,7 +45,7 @@ sources:
     # etag_path: "blocklists/stevenblack_hosts.txt.etag"
     # last_modified_path: "blocklists/stevenblack_hosts.txt.last_modified"
 
-## specify on the fly rewrites for all sites, or by host names - watch indentation!
+## Specify on the fly rewrites for all sites, or by host names - watch indentation!
 ## rewrite actions are applied in remove, replace, css order each time a matching HTML response is intercepted.
 ## global settings
 rewrites:
