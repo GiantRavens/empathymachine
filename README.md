@@ -2,6 +2,14 @@
 
 EmpathyMachine is a Rust-based HTTP/HTTPS proxy designed to block trackers and ads while letting you inspect or intercept TLS traffic when you trust the generated root certificate. It succeeds the earlier Python prototype called middleman and focuses on performance, modern TLS support, and flexible blocklist management.
 
+Unlike DNS-only solutions such as Pi-hole or AdGuard Home, EmpathyMachine operates at the HTTP layer as well, allowing on-the-fly content rewrites, TLS interception for deeper inspection, and per-request decisions informed by both DNS and application data. It coexists with traditional network blockers like the excellent Little Snitch. 
+
+Use it to streamline and quiet your personal web experience and even rewrite web page sections or common patterns on the fly, even replace mindless jargon like "utilize" with "use". 
+
+## Responsible Use
+
+Use **EmpathyMachine** to understand the scope and impact of aggressive ad and tracking tech as you browse, but "with great power comes great responsibility": only intercept traffic you own or have permission to inspect, and stay within local laws and site terms of service.
+
 ## Key Features
 
 - **Hosts-format blocklists** – Load local files or fetch remote lists (Steven Black, OISD, etc.) to deny matching domains or URL path fragments.
@@ -22,7 +30,7 @@ EmpathyMachine is a Rust-based HTTP/HTTPS proxy designed to block trackers and a
 1. Clone the repository and enter the project directory:
 
     ```bash
-    git clone https://github.com/your-org/empathymachine.git
+    git clone https://github.com/GiantRavens/empathymachine.git
     cd empathymachine
     ```
 
@@ -39,7 +47,7 @@ EmpathyMachine is a Rust-based HTTP/HTTPS proxy designed to block trackers and a
     ./empathymachine start
     ```
 
-    Add `--update-lists` to refresh remote blocklists before starting, or append `-- --args` to forward extra flags to `cargo run`.
+    Add `--update-lists` to refresh remote blocklists before starting, or append `-- --args` to forward extra flags to the underlying `cargo run`.
 
 4. Trust the generated CA so browsers accept intercepted certificates:
 
@@ -53,28 +61,28 @@ EmpathyMachine is a Rust-based HTTP/HTTPS proxy designed to block trackers and a
 
 ## Configuration
 
-EmpathyMachine reads `config.yaml` (or `config.sample.yaml` as a template). Key sections:
+EmpathyMachine reads `config.yaml` (use `config.sample.yaml` as a template). Key sections:
 
 ```yaml
-bind_addr: "127.0.0.1:8080"   # proxy listen address (change to 0.0.0.0:8080 to serve other devices)
-blocklists: []                 # local hosts-format files to load
-sources:                       # optional remote blocklist downloads
+bind_addr: "127.0.0.1:8080" # proxy listen address (change to 0.0.0.0:8080 to serve other devices)
+blocklists: []              # local hosts-format files to load
+sources:                    # optional remote blocklist downloads
   - url: "https://example.com/hosts"
     destination: "blocklists/example-hosts.txt"
 
 tls:
-  enable_intercept: true       # turn HTTPS MITM on/off
-  ca_dir: certs                # directory for root CA and keys
-  upstream_insecure: false     # allow invalid upstream certs when true
-  bypass_hosts:                # domains to tunnel without interception
+  enable_intercept: true    # turn HTTPS MITM on/off
+  ca_dir: certs             # directory for root CA and keys
+  upstream_insecure: false  # allow invalid upstream certs when true
+  bypass_hosts:             # domains to tunnel without interception
     - "gateway.icloud.com"
     - "*.teams.microsoft.com"
 
 dns:
-  enable: true                 # start the embedded trust-dns sinkhole
-  bind_addr: "127.0.0.1:8053" # UDP/TCP listener for DNS clients (use 0.0.0.0:8053 for LAN clients)
-  upstreams:                   # DoT/DoH/UDP/TCP resolvers EmpathyMachine forwards to
-    - address: "1.1.1.1:853"
+  enable: true                # start the embedded trust-dns sinkhole
+  bind_addr: "127.0.0.1:8053" # UDP/TCP listener for DNS clients (using 0.0.0.0:8053 for LAN clients)
+  upstreams:                  # DoT/DoH/UDP/TCP resolvers EmpathyMachine forwards to
+    - address: "1.1.1.1:853"  # example when using Cloudflare's DNS service 
       transport: tls
       dns_name: "cloudflare-dns.com"
 ```
@@ -94,16 +102,16 @@ Remember to restart the proxy after editing `config.yaml` so changes take effect
 
 ## DNS Sinkhole Usage
 
-1. Enable the DNS section in `config.yaml` (see above). By default the sample configuration binds to `127.0.0.1:8053` and forwards to Cloudflare DoT with DNSSEC validation.
-2. Start EmpathyMachine (`RUST_LOG=info cargo run`). You should see a log line similar to `dns sinkhole listening bind=127.0.0.1:8053`.
+1. Enable the DNS section in `config.yaml` (see above). By default the sample configuration binds to `127.0.0.1:8053` and forwards to Cloudflare DoT with DNSSEC validation. Port :8053 seems to play nicely with local services.
+2. Start EmpathyMachine (`empathymachine start`). You should see a log line similar to `dns sinkhole listening bind=127.0.0.1:8053`.
 3. Verify blocking with `dig` (replace the domain with one present in your blocklist):
 
    ```bash
-   dig @127.0.0.1 -p 8053 drifft.com A
-   dig @127.0.0.1 -p 8053 drifft.com AAAA
+   dig @127.0.0.1 -p 8053 adsandtrackingareawesome.com A
+   dig @127.0.0.1 -p 8053 adsandtrackingareawesome.com AAAA
    ```
 
-   Blocked domains return `0.0.0.0` for A records, `::` for AAAA, and NXDOMAIN for other types. Allowed domains are forwarded to the configured upstreams.
+   Blocked domains efficiently return `0.0.0.0` for A records, `::` for AAAA, and NXDOMAIN for other types. Allowed domains are forwarded to the configured upstreams.
 4. Point client devices to EmpathyMachine for DNS. On macOS you can configure Wi‑Fi → DNS via **System Settings → Wi-Fi → Details → DNS**; keep a fallback resolver beneath `127.0.0.1` if you like.
 
    ```text
@@ -111,12 +119,12 @@ Remember to restart the proxy after editing `config.yaml` so changes take effect
    Server: 1.1.1.1
    ```
 
-   With DNS routed through EmpathyMachine, all subdomains of a listed host are also sinkholed (e.g. a `drifft.com` entry covers `www.drifft.com`, `ads.api.drifft.com`, etc.).
+   With DNS routed through EmpathyMachine, all subdomains of a listed host are also sinkholed (e.g. a `adsandtrackingareawesome.com` entry covers `www.adsandtrackingareawesome.com`, `evenmoreads.adsandtrackingareawesome.com`, etc.).
 
 ## Operational Tips
 
 - **Observing logs** – `tracing` emits INFO for blocked requests and WARN for TLS or HTTP issues (e.g., clients that reject MITM or non-HTTP protocols like `mtalk.google.com`). If a service pins certificates or uses HTTP/2 only, add it to `tls.bypass_hosts`.
-- **Blocklist refresh** – Run `cargo run -- --refresh-blocklists` as a cron job or manually; the proxy exits after downloads.
+- **Blocklist refresh** – Run `./empathymachine refresh-blocklists`; EmpathyMachine downloads configured sources and exits. Alternatively, pass `--update-lists` when running `./empathymachine start` to refresh lists before launching the proxy.
 - **Testing** – Execute `cargo test` to run unit and integration tests. Current suites cover blocklist behavior and HTTP pass-through scenarios.
 - **Certificates** – Root CA and keys live under the `ca_dir` (default `certs`). Deleting that directory will cause a new CA to be generated on next startup. See [docs/cert-import.md](docs/cert-import.md) for platform-specific trust-store instructions.
 
