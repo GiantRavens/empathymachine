@@ -14,7 +14,7 @@ Use **EmpathyMachine** to understand the scope and impact of aggressive ad and t
 
 - **Hosts-format blocklists** – Load local files or fetch remote lists (Steven Black, OISD, etc.) to deny matching domains or URL path fragments.
 - **HTTPS interception with rcgen 0.14 + rustls 0.21** – Generates and persists a self-signed CA, automatically issues leaf certificates per host, and performs MITM for inspection.
-- **Configurable bypass allowlist** – Skip interception for pinned or unsupported services by listing exact domains or wildcard suffixes (for example, `gateway.icloud.com` or `*.microsoft.com`).
+- **Configurable bypass allowlist** – Skip interception for pinned or unsupported services by listing exact domains or wildcard suffixes (for example, `gateway.icloud.com`).
 - **DNS sinkhole with trust-dns** – Runs a local resolver that answers blocked domains with `0.0.0.0`/`::` (or NXDOMAIN) and forwards everything else to secure upstreams (DoT/DoH/DNSSEC).
 - **CLI utilities & wrapper** – The `./empathymachine` launcher wraps `cargo run` and exposes shortcuts like `start`, `dump-ca`, and `refresh-blocklists`. Under the hood the binary still accepts flags such as `--dump-ca` to print the root certificate PEM or `--refresh-blocklists` to fetch remote sources and exit.
 - **Rich logging** – Uses `tracing` to show blocked requests, TLS interception outcomes, and blocklist refresh status.
@@ -34,20 +34,19 @@ Use **EmpathyMachine** to understand the scope and impact of aggressive ad and t
     cd empathymachine
     ```
 
-2. (Optional) Copy the sample configuration and edit `config.yaml` as needed:
+2. Copy the sample configuration and edit `config.yaml` as needed:
 
     ```bash
     cp config.sample.yaml config.yaml
-    "${EDITOR:-nano}" config.yaml
     ```
 
-3. Launch the proxy with the wrapper script (it creates CA material on first run):
+3. Launch the proxy with the wrapper script executable - it creates CA certs on first run):
 
     ```bash
     ./empathymachine start
     ```
 
-    Add `--update-lists` to refresh remote blocklists before starting, or append `-- --args` to forward extra flags to the underlying `cargo run`.
+    Add `--update-lists` to refresh remote blocklists before starting.
 
 4. Trust the generated CA so browsers accept intercepted certificates:
 
@@ -57,7 +56,9 @@ Use **EmpathyMachine** to understand the scope and impact of aggressive ad and t
 
     Import `empathy-root.pem` into your OS/browser trust store (on macOS use **Keychain Access → System → File → Import Items…**, then mark **Always Trust** under *Trust*).
 
-5. Point your browser or tooling at the proxy address (`127.0.0.1:8080` unless overridden).
+5. Point your browser to the proxy address (`127.0.0.1:8080`).
+
+You should now have a much cleaner web browsing experience. New annoyances are easily added to your config.yaml - repeat as desired.
 
 ## Configuration
 
