@@ -8,6 +8,8 @@ use lol_html::{HtmlRewriter, Settings, element};
 
 use crate::config::{HostRewrite, Replacement, RewriteConfig};
 
+pub const REWRITTEN_HEADER: &str = "x-empathymachine-rewritten";
+
 #[derive(Debug, Clone, Default)]
 pub struct RewriteRules {
     global_remove: Vec<String>,
@@ -187,6 +189,9 @@ impl RewriteRules {
         if let Ok(value) = HeaderValue::from_str(&output.len().to_string()) {
             parts.headers.insert(CONTENT_LENGTH, value);
         }
+        parts
+            .headers
+            .insert(REWRITTEN_HEADER, HeaderValue::from_static("1"));
 
         Response::from_parts(parts, Body::from(output))
     }

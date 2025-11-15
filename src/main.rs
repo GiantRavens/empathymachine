@@ -1,8 +1,14 @@
 use std::{env, path::PathBuf, sync::Arc};
 
 use empathymachine::{
-    blocklist::BlockRules, blocklist_fetcher, ca::CaStore, config::Config, dns::DnsService,
-    proxy::ProxyServer, rewriter::RewriteRules,
+    admin::{self, AppState},
+    blocklist::BlockRules,
+    blocklist_fetcher,
+    ca::CaStore,
+    config::Config,
+    dns::DnsService,
+    proxy::ProxyServer,
+    rewriter::RewriteRules,
 };
 
 // entrypoint wiring up proxy server
@@ -21,6 +27,7 @@ async fn main() {
         eprintln!("failed to load configuration: {err}");
         std::process::exit(1);
     });
+    let config = Arc::new(config);
 
     let maybe_ca_store = if config.tls.enable_intercept || dump_ca {
         match CaStore::load_or_init(config.tls.ca_path()) {
@@ -68,6 +75,16 @@ async fn main() {
         Err(_) => config.bind_addr,
     };
 
+    // start admin server on separate port
+    let admin_state = Arc::new(AppState::new(config.clone()));
+    let admin_bind = config.admin_bind_addr;
+    let admin_state_for_task = admin_state.clone();
+    tokio::spawn(async move {
+        if let Err(err) = admin::run_admin_server(admin_state_for_task, admin_bind).await {
+            tracing::error!(error = %err, "admin server terminated unexpectedly");
+        }
+    });
+
     let block_entries = match config.load_block_entries() {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -101,13 +118,14 @@ async fn main() {
     };
     let rewrite_rules = RewriteRules::from_config(&config.rewrites);
 
-    let proxy = ProxyServer::with_tls(
+    let proxy = ProxyServer::with_tls_and_state(
         bind_addr,
         block_rules,
         maybe_ca_store.clone(),
         config.tls.upstream_insecure,
         config.tls.bypass_hosts.clone(),
         rewrite_rules,
+        admin_state.clone(),
     );
 
     if let Err(err) = proxy.run().await {

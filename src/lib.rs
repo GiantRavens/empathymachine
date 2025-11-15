@@ -6,3 +6,4 @@ pub mod config;
 pub mod dns;
 pub mod proxy;
 pub mod rewriter;
+pub mod admin;

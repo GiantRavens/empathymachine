@@ -1,8 +1,12 @@
 use std::{
-    collections::HashSet, convert::Infallible, net::SocketAddr, sync::Arc, time::SystemTime,
+    collections::HashSet,
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{atomic::Ordering, Arc},
+    time::{Instant, SystemTime},
 };
 
-use hyper::header::{ACCEPT_ENCODING, HOST, HeaderValue};
+use hyper::header::{ACCEPT_ENCODING, HOST, HeaderValue, REFERER, USER_AGENT};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::Body,
@@ -24,9 +28,10 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::{
+    admin::{AppState, BlockedEvent},
     blocklist::BlockRules,
     ca::{CaStore, IssuedCert},
-    rewriter::RewriteRules,
+    rewriter::{RewriteRules, REWRITTEN_HEADER},
 };
 
 // minimal pass-through proxy server module
@@ -40,6 +45,7 @@ pub struct ProxyServer {
     allow_insecure_upstream: bool,
     bypass_hosts: Arc<BypassList>,
     rewrite_rules: Arc<RewriteRules>,
+    app_state: Option<Arc<AppState>>,
 }
 
 impl ProxyServer {
@@ -85,7 +91,29 @@ impl ProxyServer {
             allow_insecure_upstream,
             bypass_hosts: Arc::new(BypassList::new(bypass_hosts)),
             rewrite_rules: Arc::new(rewrite_rules),
+            app_state: None,
         }
+    }
+
+    pub fn with_tls_and_state(
+        bind_addr: SocketAddr,
+        block_rules: BlockRules,
+        ca_store: Option<Arc<CaStore>>,
+        allow_insecure_upstream: bool,
+        bypass_hosts: Vec<String>,
+        rewrite_rules: RewriteRules,
+        app_state: Arc<AppState>,
+    ) -> Self {
+        let mut server = Self::with_tls(
+            bind_addr,
+            block_rules,
+            ca_store,
+            allow_insecure_upstream,
+            bypass_hosts,
+            rewrite_rules,
+        );
+        server.app_state = Some(app_state);
+        server
     }
 
     pub async fn run(self) -> io::Result<()> {
@@ -98,6 +126,7 @@ impl ProxyServer {
         let allow_insecure_upstream = self.allow_insecure_upstream;
         let bypass_hosts = self.bypass_hosts.clone();
         let rewrite_rules = self.rewrite_rules.clone();
+        let app_state = self.app_state.clone();
         let shutdown_signal = tokio::signal::ctrl_c();
         tokio::pin!(shutdown_signal);
 
@@ -118,6 +147,7 @@ impl ProxyServer {
                     let allow_insecure_upstream = allow_insecure_upstream;
                     let bypass_hosts = bypass_hosts.clone();
                     let rewrite_rules = rewrite_rules.clone();
+                    let app_state = app_state.clone();
                     tokio::spawn(async move {
                         if let Err(err) = handle_connection(
                             stream,
@@ -127,6 +157,7 @@ impl ProxyServer {
                             rewrite_rules,
                             ca_store,
                             allow_insecure_upstream,
+                            app_state,
                         )
                         .await
                         {
@@ -156,6 +187,7 @@ async fn handle_connection(
     rewrite_rules: Arc<RewriteRules>,
     ca_store: Option<Arc<CaStore>>,
     allow_insecure_upstream: bool,
+    app_state: Option<Arc<AppState>>,
 ) -> Result<(), ProxyError> {
     let service = service_fn(move |req| {
         let client = client.clone();
@@ -163,6 +195,7 @@ async fn handle_connection(
         let bypass_hosts = bypass_hosts.clone();
         let rewrite_rules = rewrite_rules.clone();
         let ca_store = ca_store.clone();
+        let app_state = app_state.clone();
         async move {
             handle_request(
                 client,
@@ -171,6 +204,7 @@ async fn handle_connection(
                 rewrite_rules,
                 ca_store,
                 allow_insecure_upstream,
+                app_state,
                 req,
             )
             .await
@@ -195,8 +229,10 @@ async fn handle_request(
     rewrite_rules: Arc<RewriteRules>,
     ca_store: Option<Arc<CaStore>>,
     allow_insecure_upstream: bool,
+    app_state: Option<Arc<AppState>>,
     req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
+    let state_for_errors = app_state.clone();
     match proxy_request(
         client,
         rules,
@@ -204,12 +240,16 @@ async fn handle_request(
         rewrite_rules,
         ca_store,
         allow_insecure_upstream,
+        app_state.clone(),
         req,
     )
     .await
     {
         Ok(response) => Ok(response),
         Err(err) => {
+            if let Some(state) = state_for_errors.as_ref() {
+                state.error_total.fetch_add(1, Ordering::Relaxed);
+            }
             tracing::warn!(error = %err, "proxy request failed");
             let response = Response::builder()
                 .status(err.status_code())
@@ -232,8 +272,13 @@ async fn proxy_request(
     rewrite_rules: Arc<RewriteRules>,
     ca_store: Option<Arc<CaStore>>,
     allow_insecure_upstream: bool,
+    app_state: Option<Arc<AppState>>,
     req: Request<Body>,
 ) -> Result<Response<Body>, ProxyError> {
+    if let Some(state) = app_state.as_ref() {
+        state.requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     if req.method() == Method::CONNECT {
         return proxy_connect(
             req,
@@ -242,17 +287,19 @@ async fn proxy_request(
             rewrite_rules,
             ca_store,
             allow_insecure_upstream,
+            app_state,
         )
         .await;
     }
 
-    forward_http_request(client, rules, rewrite_rules, req).await
+    forward_http_request(client, rules, rewrite_rules, app_state, req).await
 }
 
 async fn forward_http_request(
     client: hyper::Client<HttpConnector, Body>,
     rules: Arc<BlockRules>,
     rewrite_rules: Arc<RewriteRules>,
+    app_state: Option<Arc<AppState>>,
     req: Request<Body>,
 ) -> Result<Response<Body>, ProxyError> {
     let (mut parts, body) = req.into_parts();
@@ -273,6 +320,47 @@ async fn forward_http_request(
     let host_str = authority.host();
 
     if rules.should_block(host_str, path) {
+        let referer = parts
+            .headers
+            .get(REFERER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let user_agent = parts
+            .headers
+            .get(USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        if let Some(state) = app_state.as_ref() {
+            state.blocked_total.fetch_add(1, Ordering::Relaxed);
+
+            let timestamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis().to_string())
+                .unwrap_or_else(|_| "0".to_string());
+
+            let event = BlockedEvent {
+                id: format!("blk-{}", timestamp),
+                timestamp,
+                domain: host_str.to_string(),
+                path: path.to_string(),
+                action: "blocked".to_string(),
+                category: None,
+                rule_id: None,
+                rule_name: None,
+                reason: Some("blocked by rule".to_string()),
+                referer,
+                user_agent,
+            };
+
+            if let Ok(mut buf) = state.recent_blocked.lock() {
+                if buf.len() == buf.capacity() {
+                    buf.pop_front();
+                }
+                buf.push_back(event);
+            }
+        }
+
         tracing::info!(host = %authority, path = %path, "blocked request by rule");
         return Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
@@ -308,11 +396,46 @@ async fn forward_http_request(
     strip_hop_by_hop_headers(&mut parts.headers);
 
     let request = Request::from_parts(parts, body);
+    let start = Instant::now();
     let response = client
         .request(request)
         .await
         .map_err(ProxyError::Upstream)?;
-    let rewritten = rewrite_rules.rewrite_response(host_str, response).await;
+    let mut rewritten = rewrite_rules
+        .rewrite_response(host_str, response)
+        .await;
+
+    let rewrote = rewritten.headers().get(REWRITTEN_HEADER).is_some();
+
+    if let Some(state) = app_state.as_ref() {
+        state.allowed_total.fetch_add(1, Ordering::Relaxed);
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        state.latency_total_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
+        state.latency_sample_count.fetch_add(1, Ordering::Relaxed);
+
+        let mut current_max = state.latency_max_ms.load(Ordering::Relaxed);
+        while elapsed_ms > current_max {
+            match state.latency_max_ms.compare_exchange(
+                current_max,
+                elapsed_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current_max = actual,
+            }
+        }
+
+        if rewrote {
+            state.rewritten_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    if rewrote {
+        rewritten.headers_mut().remove(REWRITTEN_HEADER);
+    }
+
     Ok(rewritten)
 }
 
@@ -323,6 +446,7 @@ async fn proxy_connect(
     rewrite_rules: Arc<RewriteRules>,
     ca_store: Option<Arc<CaStore>>,
     allow_insecure_upstream: bool,
+    app_state: Option<Arc<AppState>>,
 ) -> Result<Response<Body>, ProxyError> {
     let authority = req
         .uri()
@@ -333,6 +457,45 @@ async fn proxy_connect(
     let host_only = authority.split(':').next().unwrap_or_default().to_string();
 
     if rules.should_block(&host_only, "/") {
+        let referer = req
+            .headers()
+            .get(REFERER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let user_agent = req
+            .headers()
+            .get(USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        if let Some(state) = app_state.as_ref() {
+            state.blocked_total.fetch_add(1, Ordering::Relaxed);
+
+            let timestamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis().to_string())
+                .unwrap_or_else(|_| "0".to_string());
+
+            let event = BlockedEvent {
+                id: format!("blk-{}", timestamp),
+                timestamp,
+                domain: host_only.clone(),
+                path: "/".to_string(),
+                action: "blocked".to_string(),
+                category: None,
+                rule_id: None,
+                rule_name: None,
+                reason: Some("blocked connect request by rule".to_string()),
+                referer,
+                user_agent,
+            };
+
+            if let Ok(mut buf) = state.recent_blocked.lock() {
+                if buf.len() == buf.capacity() {
+                    buf.pop_front();
+                }
+                buf.push_back(event);
+            }
+        }
         tracing::info!(host = %authority, "blocked connect request by rule");
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
@@ -353,6 +516,7 @@ async fn proxy_connect(
     let rules_for_task = rules.clone();
     let ca_for_task = if bypass_tls { None } else { ca_store.clone() };
     let rewrite_for_task = rewrite_rules.clone();
+    let app_state_for_task = app_state.clone();
     tokio::spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
@@ -365,6 +529,7 @@ async fn proxy_connect(
                         rewrite_for_task,
                         store,
                         allow_insecure_upstream,
+                        app_state_for_task.clone(),
                     )
                     .await
                     {
@@ -462,6 +627,7 @@ async fn handle_tls_intercept(
     rewrite_rules: Arc<RewriteRules>,
     ca_store: Arc<CaStore>,
     allow_insecure_upstream: bool,
+    app_state: Option<Arc<AppState>>,
 ) -> Result<(), InterceptError> {
     tracing::debug!(host = %authority, "attempting tls interception");
 
@@ -516,6 +682,7 @@ async fn handle_tls_intercept(
     let host_arc = Arc::new(host_only.clone());
     let rules_arc = rules.clone();
     let rewrites_arc = rewrite_rules.clone();
+    let app_state_arc = app_state.clone();
     let service = service_fn(move |req| {
         handle_mitm_request(
             req,
@@ -524,6 +691,7 @@ async fn handle_tls_intercept(
             authority_arc.clone(),
             host_arc.clone(),
             rewrites_arc.clone(),
+            app_state_arc.clone(),
         )
     });
 
@@ -544,7 +712,12 @@ async fn handle_mitm_request(
     authority: Arc<String>,
     host_only: Arc<String>,
     rewrite_rules: Arc<RewriteRules>,
+    app_state: Option<Arc<AppState>>,
 ) -> Result<Response<Body>, hyper::Error> {
+    if let Some(state) = app_state.as_ref() {
+        state.requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     let path = req
         .uri()
         .path_and_query()
@@ -552,6 +725,47 @@ async fn handle_mitm_request(
         .unwrap_or("/");
 
     if rules.should_block(&host_only, path) {
+        let referer = req
+            .headers()
+            .get(REFERER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let user_agent = req
+            .headers()
+            .get(USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        if let Some(state) = app_state.as_ref() {
+            state.blocked_total.fetch_add(1, Ordering::Relaxed);
+
+            let timestamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis().to_string())
+                .unwrap_or_else(|_| "0".to_string());
+
+            let event = BlockedEvent {
+                id: format!("blk-{}", timestamp),
+                timestamp,
+                domain: host_only.as_str().to_string(),
+                path: path.to_string(),
+                action: "blocked".to_string(),
+                category: None,
+                rule_id: None,
+                rule_name: None,
+                reason: Some("blocked by rule".to_string()),
+                referer,
+                user_agent,
+            };
+
+            if let Ok(mut buf) = state.recent_blocked.lock() {
+                if buf.len() == buf.capacity() {
+                    buf.pop_front();
+                }
+                buf.push_back(event);
+            }
+        }
+
         tracing::info!(host = %authority, path = %path, "blocked https request by rule");
         return Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
@@ -578,12 +792,59 @@ async fn handle_mitm_request(
         .unwrap_or_else(|_| http::Uri::from_static("/"));
 
     let mut sender = sender.lock().await;
-    let response = sender.send_request(req).await?;
+    let start = Instant::now();
+    let response = match sender.send_request(req).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            if let Some(state) = app_state.as_ref() {
+                state.error_total.fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::warn!(target = %authority, error = %err, "mitm upstream request failed");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(format!("proxy error: {err}")))
+                .unwrap_or_else(|_| Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Body::empty())
+                    .unwrap()));
+        }
+    };
     drop(sender);
 
-    let rewritten = rewrite_rules
+    let mut rewritten = rewrite_rules
         .rewrite_response(host_only.as_str(), response)
         .await;
+    let rewrote = rewritten.headers().get(REWRITTEN_HEADER).is_some();
+
+    if let Some(state) = app_state.as_ref() {
+        state.allowed_total.fetch_add(1, Ordering::Relaxed);
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        state.latency_total_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
+        state.latency_sample_count.fetch_add(1, Ordering::Relaxed);
+
+        let mut current_max = state.latency_max_ms.load(Ordering::Relaxed);
+        while elapsed_ms > current_max {
+            match state.latency_max_ms.compare_exchange(
+                current_max,
+                elapsed_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current_max = actual,
+            }
+        }
+
+        if rewrote {
+            state.rewritten_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    if rewrote {
+        rewritten.headers_mut().remove(REWRITTEN_HEADER);
+    }
+
     Ok(rewritten)
 }
 

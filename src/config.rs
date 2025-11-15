@@ -14,6 +14,8 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default = "default_bind_addr")]
     pub bind_addr: SocketAddr,
+    #[serde(default = "default_admin_bind_addr")]
+    pub admin_bind_addr: SocketAddr,
     #[serde(default)]
     pub blocklists: Vec<PathBuf>,
     #[serde(default)]
@@ -50,6 +52,10 @@ pub struct TlsConfig {
 
 fn default_bind_addr() -> SocketAddr {
     "127.0.0.1:8080".parse().expect("default bind address")
+}
+
+fn default_admin_bind_addr() -> SocketAddr {
+    "127.0.0.1:8081".parse().expect("default admin bind address")
 }
 
 fn default_enable_intercept() -> bool {
@@ -136,6 +142,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             bind_addr: default_bind_addr(),
+            admin_bind_addr: default_admin_bind_addr(),
             blocklists: Vec::new(),
             sources: Vec::new(),
             tls: TlsConfig::default(),
