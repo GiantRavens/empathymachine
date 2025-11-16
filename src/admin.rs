@@ -95,6 +95,28 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       </section>
 
       <section class="card">
+        <h2 class="metric-help" title="Most recent allowed requests with basic metadata.">Recently allowed</h2>
+        <table>
+          <thead>
+            <tr>
+              <th class="nowrap">When</th>
+              <th>Method</th>
+              <th>Domain</th>
+              <th>Path</th>
+              <th>Status</th>
+              <th>Rewritten</th>
+              <th>Client</th>
+              <th>Referer</th>
+              <th>User agent</th>
+            </tr>
+          </thead>
+          <tbody id="allowed-body">
+            <tr><td colspan="9" class="muted">Waiting for data...</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="card">
         <h2 class="metric-help" title="Most recent blocked requests with context for debugging.">Recently blocked</h2>
         <table>
           <thead>
@@ -103,12 +125,15 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
               <th>Domain</th>
               <th>Path</th>
               <th>Reason</th>
+              <th>TLS SNI</th>
+              <th>TLS ALPN</th>
+              <th>Client</th>
               <th>Referer</th>
               <th>User agent</th>
             </tr>
           </thead>
           <tbody id="blocked-body">
-            <tr><td colspan="6" class="muted">Waiting for data...</td></tr>
+            <tr><td colspan="9" class="muted">Waiting for data...</td></tr>
           </tbody>
         </table>
       </section>
@@ -145,6 +170,12 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           if (uptimeEl) uptimeEl.textContent = 'Uptime ' + formatUptime(data.uptime_seconds);
           const stateEl = document.getElementById('status-state');
           if (stateEl) stateEl.textContent = data.state === 'running' ? 'Running' : data.state;
+          const statusSubEl = document.getElementById('status-sub');
+          if (statusSubEl) {
+            statusSubEl.textContent = data.fingerprinting_enabled
+              ? 'TLS fingerprinting enabled'
+              : 'TLS fingerprinting disabled';
+          }
         } catch (e) {
           console.error('status error', e);
         }
@@ -208,6 +239,65 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         }
       }
 
+      async function refreshAllowed() {
+        try {
+          const data = await fetchJson('/api/allowed/recent');
+          const events = (data.events || []).slice().reverse();
+          const tbody = document.getElementById('allowed-body');
+          if (!tbody) return;
+          tbody.innerHTML = '';
+          if (events.length === 0) {
+            const tr = document.createElement('tr');
+            const td = document.createElement('td');
+            td.colSpan = 9;
+            td.textContent = 'No allowed requests yet';
+            td.className = 'muted';
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+            return;
+          }
+          for (const ev of events) {
+            const tr = document.createElement('tr');
+            const when = document.createElement('td');
+            when.textContent = formatTime(ev.timestamp);
+            when.className = 'nowrap';
+            const method = document.createElement('td');
+            method.textContent = ev.method || '—';
+            const dom = document.createElement('td');
+            dom.textContent = ev.domain;
+            const path = document.createElement('td');
+            path.textContent = ev.path || '/';
+            const status = document.createElement('td');
+            status.textContent = ev.status != null ? ev.status : '—';
+            const rewritten = document.createElement('td');
+            rewritten.textContent = ev.rewritten ? 'Yes' : 'No';
+            const client = document.createElement('td');
+            if (ev.client_ip) {
+              const port = ev.client_port ? `:${ev.client_port}` : '';
+              client.textContent = `${ev.client_ip}${port}`;
+            } else {
+              client.textContent = '—';
+            }
+            const refTd = document.createElement('td');
+            refTd.textContent = ev.referer || '—';
+            const uaTd = document.createElement('td');
+            uaTd.textContent = ev.user_agent || '—';
+            tr.appendChild(when);
+            tr.appendChild(method);
+            tr.appendChild(dom);
+            tr.appendChild(path);
+            tr.appendChild(status);
+            tr.appendChild(rewritten);
+            tr.appendChild(client);
+            tr.appendChild(refTd);
+            tr.appendChild(uaTd);
+            tbody.appendChild(tr);
+          }
+        } catch (e) {
+          console.error('allowed error', e);
+        }
+      }
+
       async function refreshBlocked() {
         try {
           const data = await fetchJson('/api/blocked/recent');
@@ -218,7 +308,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           if (events.length === 0) {
             const tr = document.createElement('tr');
             const td = document.createElement('td');
-            td.colSpan = 6;
+            td.colSpan = 9;
             td.textContent = 'No blocked requests yet';
             td.className = 'muted';
             tr.appendChild(td);
@@ -236,6 +326,21 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
             path.textContent = ev.path || '/';
             const reason = document.createElement('td');
             reason.textContent = ev.reason || ev.action || '';
+            const sniTd = document.createElement('td');
+            sniTd.textContent = ev.tls_sni || '—';
+            const alpnTd = document.createElement('td');
+            if (Array.isArray(ev.tls_alpn) && ev.tls_alpn.length) {
+              alpnTd.textContent = ev.tls_alpn.join(', ');
+            } else {
+              alpnTd.textContent = '—';
+            }
+            const client = document.createElement('td');
+            if (ev.client_ip) {
+              const port = ev.client_port ? `:${ev.client_port}` : '';
+              client.textContent = `${ev.client_ip}${port}`;
+            } else {
+              client.textContent = '—';
+            }
             const refTd = document.createElement('td');
             refTd.textContent = ev.referer || '—';
             const uaTd = document.createElement('td');
@@ -244,6 +349,9 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
             tr.appendChild(dom);
             tr.appendChild(path);
             tr.appendChild(reason);
+            tr.appendChild(sniTd);
+            tr.appendChild(alpnTd);
+            tr.appendChild(client);
             tr.appendChild(refTd);
             tr.appendChild(uaTd);
             tbody.appendChild(tr);
@@ -257,6 +365,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         await Promise.all([
           refreshStatus(),
           refreshMetrics(),
+          refreshAllowed(),
           refreshBlocked(),
         ]);
       }
@@ -287,6 +396,7 @@ pub struct AppState {
 
     // recent blocked events for explanation UI
     pub recent_blocked: Arc<Mutex<VecDeque<BlockedEvent>>>,
+    pub recent_allowed: Arc<Mutex<VecDeque<AllowedEvent>>>,
 }
 
 impl AppState {
@@ -303,8 +413,28 @@ impl AppState {
             latency_sample_count: Arc::new(AtomicU64::new(0)),
             latency_max_ms: Arc::new(AtomicU64::new(0)),
             recent_blocked: Arc::new(Mutex::new(VecDeque::with_capacity(256))),
+            recent_allowed: Arc::new(Mutex::new(VecDeque::with_capacity(256))),
         }
     }
+
+    pub fn fingerprint_blocked_connect(&self) -> bool {
+        self.config.proxy.fingerprint_blocked_connect
+    }
+}
+
+#[derive(Serialize, Clone)]
+pub struct AllowedEvent {
+    pub id: String,
+    pub timestamp: String,
+    pub method: String,
+    pub domain: String,
+    pub path: String,
+    pub status: u16,
+    pub rewritten: bool,
+    pub referer: Option<String>,
+    pub user_agent: Option<String>,
+    pub client_ip: Option<String>,
+    pub client_port: Option<u16>,
 }
 
 #[derive(Serialize, Clone)]
@@ -320,6 +450,12 @@ pub struct BlockedEvent {
     pub reason: Option<String>,
     pub referer: Option<String>,
     pub user_agent: Option<String>,
+    pub client_ip: Option<String>,
+    pub client_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_sni: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub tls_alpn: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -328,6 +464,7 @@ struct StatusResponse {
     version: String,
     uptime_seconds: u64,
     state: String,
+    fingerprinting_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -382,6 +519,7 @@ async fn handle_request(req: Request<Body>, state: Arc<AppState>) -> Result<Resp
         (&Method::GET, "/") | (&Method::GET, "/index.html") => dashboard_handler(),
         (&Method::GET, "/api/status") => status_handler(state).await,
         (&Method::GET, "/api/metrics") => metrics_handler(state).await,
+        (&Method::GET, "/api/allowed/recent") => recent_allowed_handler(state).await,
         (&Method::GET, "/api/blocked/recent") => recent_blocked_handler(state).await,
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -400,6 +538,34 @@ fn dashboard_handler() -> Response<Body> {
         .unwrap()
 }
 
+async fn recent_allowed_handler(state: Arc<AppState>) -> Response<Body> {
+    let events: Vec<AllowedEvent> = {
+        let guard = state.recent_allowed.lock().unwrap();
+        guard.iter().cloned().collect()
+    };
+
+    let body = serde_json::json!({
+        "events": events,
+    });
+
+    let json = match serde_json::to_vec(&body) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to serialize allowed events response");
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("internal error"))
+                .unwrap();
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(json))
+        .unwrap()
+}
+
 async fn status_handler(state: Arc<AppState>) -> Response<Body> {
     let uptime = state.started_at.elapsed().as_secs();
 
@@ -408,6 +574,7 @@ async fn status_handler(state: Arc<AppState>) -> Response<Body> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: uptime,
         state: "running".to_string(),
+        fingerprinting_enabled: state.fingerprint_blocked_connect(),
     };
 
     let json = match serde_json::to_vec(&body) {
@@ -446,6 +613,7 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["state"], "running");
         assert!(json["uptime_seconds"].as_u64().is_some());
+        assert_eq!(json["fingerprinting_enabled"], Value::Bool(false));
     }
 
     #[tokio::test]
@@ -476,6 +644,27 @@ mod tests {
                 reason: None,
                 referer: Some("https://referrer.test".into()),
                 user_agent: Some("unit-test-agent".into()),
+                client_ip: Some("127.0.0.1".into()),
+                client_port: Some(4242),
+                tls_sni: Some("example.com".into()),
+                tls_alpn: vec!["http/1.1".into()],
+            });
+        }
+
+        {
+            let mut buf = state.recent_allowed.lock().unwrap();
+            buf.push_back(AllowedEvent {
+                id: "allow-test".into(),
+                timestamp: "1".into(),
+                method: "GET".into(),
+                domain: "example.com".into(),
+                path: "/".into(),
+                status: 200,
+                rewritten: false,
+                referer: None,
+                user_agent: Some("unit-test-agent".into()),
+                client_ip: Some("127.0.0.1".into()),
+                client_port: Some(4242),
             });
         }
 
@@ -493,6 +682,40 @@ mod tests {
         assert_eq!(json["latency_ms"]["max_ms"], 120);
         assert_eq!(json["buffer"]["recent_blocked_len"], 1);
         assert_eq!(json["buffer"]["recent_blocked_capacity"].as_u64().unwrap() >= 1, true);
+    }
+
+    #[tokio::test]
+    async fn recent_allowed_handler_returns_events() {
+        let config = Arc::new(Config::default());
+        let state = Arc::new(AppState::new(config));
+
+        {
+            let mut buf = state.recent_allowed.lock().unwrap();
+            buf.push_back(AllowedEvent {
+                id: "allow-test".to_string(),
+                timestamp: "1699999999999".to_string(),
+                method: "GET".to_string(),
+                domain: "allowed.example.com".to_string(),
+                path: "/".to_string(),
+                status: 200,
+                rewritten: false,
+                referer: Some("https://foo".into()),
+                user_agent: Some("tester".into()),
+                client_ip: Some("127.0.0.1".into()),
+                client_port: Some(8443),
+            });
+        }
+
+        let response = recent_allowed_handler(state.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body()).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let events = json["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["domain"], "allowed.example.com");
+        assert_eq!(events[0]["status"], 200);
+        assert_eq!(events[0]["user_agent"], "tester");
     }
 
     #[tokio::test]
@@ -514,6 +737,10 @@ mod tests {
                 reason: Some("blocked by rule".to_string()),
                 referer: Some("https://foo".into()),
                 user_agent: Some("tester".into()),
+                client_ip: Some("127.0.0.1".into()),
+                client_port: Some(8080),
+                tls_sni: None,
+                tls_alpn: Vec::new(),
             });
         }
 

@@ -17,6 +17,8 @@ pub struct Config {
     #[serde(default = "default_admin_bind_addr")]
     pub admin_bind_addr: SocketAddr,
     #[serde(default)]
+    pub proxy: ProxyConfig,
+    #[serde(default)]
     pub blocklists: Vec<PathBuf>,
     #[serde(default)]
     pub sources: Vec<BlocklistSource>,
@@ -143,11 +145,26 @@ impl Default for Config {
         Self {
             bind_addr: default_bind_addr(),
             admin_bind_addr: default_admin_bind_addr(),
+            proxy: ProxyConfig::default(),
             blocklists: Vec::new(),
             sources: Vec::new(),
             tls: TlsConfig::default(),
             rewrites: RewriteConfig::default(),
             dns: DnsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProxyConfig {
+    #[serde(default)]
+    pub fingerprint_blocked_connect: bool,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            fingerprint_blocked_connect: false,
         }
     }
 }

@@ -145,6 +145,7 @@ async fn admin_dashboard_updates_on_blocked_request() {
     assert!(html.contains("id=\"status-state\""));
     assert!(html.contains("id=\"metrics-requests\""));
     assert!(html.contains("id=\"blocked-body\""));
+    assert!(html.contains("id=\"allowed-body\""));
 
     // Clean shutdown
     admin_handle.abort();

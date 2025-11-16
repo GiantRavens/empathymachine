@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     convert::Infallible,
+    io::Cursor,
     net::SocketAddr,
     sync::{atomic::Ordering, Arc},
     time::{Instant, SystemTime},
@@ -15,12 +16,13 @@ use hyper::{
     upgrade::Upgraded,
 };
 use rustls::{
+    server::{Acceptor, Accepted},
     Certificate as RustlsCertificate, ClientConfig, OwnedTrustAnchor, PrivateKey, RootCertStore,
     ServerConfig, ServerName,
     client::{ServerCertVerified, ServerCertVerifier},
 };
 use tokio::{
-    io::{self, AsyncWriteExt},
+    io::{self, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
@@ -28,11 +30,17 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::{
-    admin::{AppState, BlockedEvent},
+    admin::{AllowedEvent, AppState, BlockedEvent},
     blocklist::BlockRules,
     ca::{CaStore, IssuedCert},
     rewriter::{RewriteRules, REWRITTEN_HEADER},
 };
+
+#[derive(Debug, Clone, Default)]
+struct FingerprintMetadata {
+    sni: Option<String>,
+    alpn: Vec<String>,
+}
 
 // minimal pass-through proxy server module
 
@@ -151,6 +159,7 @@ impl ProxyServer {
                     tokio::spawn(async move {
                         if let Err(err) = handle_connection(
                             stream,
+                            peer_addr,
                             client,
                             rules,
                             bypass_hosts,
@@ -181,6 +190,7 @@ impl ProxyServer {
 
 async fn handle_connection(
     stream: TcpStream,
+    client_addr: SocketAddr,
     client: hyper::Client<HttpConnector, Body>,
     rules: Arc<BlockRules>,
     bypass_hosts: Arc<BypassList>,
@@ -196,6 +206,7 @@ async fn handle_connection(
         let rewrite_rules = rewrite_rules.clone();
         let ca_store = ca_store.clone();
         let app_state = app_state.clone();
+        let client_addr = client_addr;
         async move {
             handle_request(
                 client,
@@ -205,6 +216,7 @@ async fn handle_connection(
                 ca_store,
                 allow_insecure_upstream,
                 app_state,
+                client_addr,
                 req,
             )
             .await
@@ -230,6 +242,7 @@ async fn handle_request(
     ca_store: Option<Arc<CaStore>>,
     allow_insecure_upstream: bool,
     app_state: Option<Arc<AppState>>,
+    client_addr: SocketAddr,
     req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
     let state_for_errors = app_state.clone();
@@ -241,6 +254,7 @@ async fn handle_request(
         ca_store,
         allow_insecure_upstream,
         app_state.clone(),
+        client_addr,
         req,
     )
     .await
@@ -273,6 +287,7 @@ async fn proxy_request(
     ca_store: Option<Arc<CaStore>>,
     allow_insecure_upstream: bool,
     app_state: Option<Arc<AppState>>,
+    client_addr: SocketAddr,
     req: Request<Body>,
 ) -> Result<Response<Body>, ProxyError> {
     if let Some(state) = app_state.as_ref() {
@@ -288,11 +303,12 @@ async fn proxy_request(
             ca_store,
             allow_insecure_upstream,
             app_state,
+            client_addr,
         )
         .await;
     }
 
-    forward_http_request(client, rules, rewrite_rules, app_state, req).await
+    forward_http_request(client, rules, rewrite_rules, app_state, client_addr, req).await
 }
 
 async fn forward_http_request(
@@ -300,10 +316,23 @@ async fn forward_http_request(
     rules: Arc<BlockRules>,
     rewrite_rules: Arc<RewriteRules>,
     app_state: Option<Arc<AppState>>,
+    client_addr: SocketAddr,
     req: Request<Body>,
 ) -> Result<Response<Body>, ProxyError> {
     let (mut parts, body) = req.into_parts();
     let original_uri = parts.uri.clone();
+    let method_str = parts.method.to_string();
+
+    let referer_header = parts
+        .headers
+        .get(REFERER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let user_agent_header = parts
+        .headers
+        .get(USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     let authority = original_uri
         .authority()
@@ -314,22 +343,14 @@ async fn forward_http_request(
 
     let path = original_uri
         .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
 
     let host_str = authority.host();
 
-    if rules.should_block(host_str, path) {
-        let referer = parts
-            .headers
-            .get(REFERER)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let user_agent = parts
-            .headers
-            .get(USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+    if rules.should_block(host_str, path.as_str()) {
+        let referer = referer_header.clone();
+        let user_agent = user_agent_header.clone();
 
         if let Some(state) = app_state.as_ref() {
             state.blocked_total.fetch_add(1, Ordering::Relaxed);
@@ -343,7 +364,7 @@ async fn forward_http_request(
                 id: format!("blk-{}", timestamp),
                 timestamp,
                 domain: host_str.to_string(),
-                path: path.to_string(),
+                path: path.clone(),
                 action: "blocked".to_string(),
                 category: None,
                 rule_id: None,
@@ -351,6 +372,10 @@ async fn forward_http_request(
                 reason: Some("blocked by rule".to_string()),
                 referer,
                 user_agent,
+                client_ip: Some(client_addr.ip().to_string()),
+                client_port: Some(client_addr.port()),
+                tls_sni: None,
+                tls_alpn: Vec::new(),
             };
 
             if let Ok(mut buf) = state.recent_blocked.lock() {
@@ -406,6 +431,7 @@ async fn forward_http_request(
         .await;
 
     let rewrote = rewritten.headers().get(REWRITTEN_HEADER).is_some();
+    let status_code = rewritten.status().as_u16();
 
     if let Some(state) = app_state.as_ref() {
         state.allowed_total.fetch_add(1, Ordering::Relaxed);
@@ -430,6 +456,18 @@ async fn forward_http_request(
         if rewrote {
             state.rewritten_total.fetch_add(1, Ordering::Relaxed);
         }
+
+        record_allowed_event(
+            state,
+            method_str,
+            host_str.to_string(),
+            path.clone(),
+            status_code,
+            rewrote,
+            referer_header.clone(),
+            user_agent_header.clone(),
+            client_addr,
+        );
     }
 
     if rewrote {
@@ -447,6 +485,7 @@ async fn proxy_connect(
     ca_store: Option<Arc<CaStore>>,
     allow_insecure_upstream: bool,
     app_state: Option<Arc<AppState>>,
+    client_addr: SocketAddr,
 ) -> Result<Response<Body>, ProxyError> {
     let authority = req
         .uri()
@@ -456,46 +495,56 @@ async fn proxy_connect(
 
     let host_only = authority.split(':').next().unwrap_or_default().to_string();
 
+    let referer = req
+        .headers()
+        .get(REFERER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let user_agent = req
+        .headers()
+        .get(USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     if rules.should_block(&host_only, "/") {
-        let referer = req
-            .headers()
-            .get(REFERER)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let user_agent = req
-            .headers()
-            .get(USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        if let Some(state) = app_state.as_ref() {
-            state.blocked_total.fetch_add(1, Ordering::Relaxed);
+        let fingerprinting_enabled = app_state
+            .as_ref()
+            .map(|state| state.fingerprint_blocked_connect())
+            .unwrap_or(false);
 
-            let timestamp = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_millis().to_string())
-                .unwrap_or_else(|_| "0".to_string());
+        if fingerprinting_enabled {
+            let authority_for_task = authority.clone();
+            let host_for_task = host_only.clone();
+            let app_state_for_task = app_state.clone();
+            let referer_for_task = referer.clone();
+            let user_agent_for_task = user_agent.clone();
+            tokio::spawn(async move {
+                capture_blocked_connect(
+                    req,
+                    authority_for_task,
+                    host_for_task,
+                    app_state_for_task,
+                    client_addr,
+                    referer_for_task,
+                    user_agent_for_task,
+                )
+                .await;
+            });
 
-            let event = BlockedEvent {
-                id: format!("blk-{}", timestamp),
-                timestamp,
-                domain: host_only.clone(),
-                path: "/".to_string(),
-                action: "blocked".to_string(),
-                category: None,
-                rule_id: None,
-                rule_name: None,
-                reason: Some("blocked connect request by rule".to_string()),
-                referer,
-                user_agent,
-            };
-
-            if let Ok(mut buf) = state.recent_blocked.lock() {
-                if buf.len() == buf.capacity() {
-                    buf.pop_front();
-                }
-                buf.push_back(event);
-            }
+            return Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .map_err(|err| ProxyError::bad_gateway(err.to_string()));
         }
+
+        record_blocked_connect(
+            app_state.clone(),
+            host_only.clone(),
+            referer,
+            user_agent,
+            client_addr,
+            FingerprintMetadata::default(),
+        );
         tracing::info!(host = %authority, "blocked connect request by rule");
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
@@ -517,6 +566,7 @@ async fn proxy_connect(
     let ca_for_task = if bypass_tls { None } else { ca_store.clone() };
     let rewrite_for_task = rewrite_rules.clone();
     let app_state_for_task = app_state.clone();
+    let client_addr_for_task = client_addr;
     tokio::spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
@@ -530,6 +580,7 @@ async fn proxy_connect(
                         store,
                         allow_insecure_upstream,
                         app_state_for_task.clone(),
+                        client_addr_for_task,
                     )
                     .await
                     {
@@ -549,6 +600,177 @@ async fn proxy_connect(
     });
 
     Ok(response)
+}
+
+fn record_blocked_connect(
+    state: Option<Arc<AppState>>,
+    host_only: String,
+    referer: Option<String>,
+    user_agent: Option<String>,
+    client_addr: SocketAddr,
+    fingerprint: FingerprintMetadata,
+) {
+    if let Some(state) = state {
+        state.blocked_total.fetch_add(1, Ordering::Relaxed);
+
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+
+        let event = BlockedEvent {
+            id: format!("blk-{}", timestamp),
+            timestamp,
+            domain: host_only,
+            path: "/".to_string(),
+            action: "blocked".to_string(),
+            category: None,
+            rule_id: None,
+            rule_name: None,
+            reason: Some("blocked connect request by rule".to_string()),
+            referer,
+            user_agent,
+            client_ip: Some(client_addr.ip().to_string()),
+            client_port: Some(client_addr.port()),
+            tls_sni: fingerprint.sni,
+            tls_alpn: fingerprint.alpn,
+        };
+
+        if let Ok(mut buf) = state.recent_blocked.lock() {
+            if buf.len() == buf.capacity() {
+                buf.pop_front();
+            }
+            buf.push_back(event);
+        }
+    }
+}
+
+async fn capture_blocked_connect(
+    req: Request<Body>,
+    authority: String,
+    host_only: String,
+    app_state: Option<Arc<AppState>>,
+    client_addr: SocketAddr,
+    referer: Option<String>,
+    user_agent: Option<String>,
+) {
+    match hyper::upgrade::on(req).await {
+        Ok(upgraded) => {
+            let fingerprint = match capture_client_hello(upgraded).await {
+                Ok(fp) => fp,
+                Err(err) => {
+                    tracing::debug!(target = %authority, error = %err, "failed to capture client hello");
+                    FingerprintMetadata::default()
+                }
+            };
+            record_blocked_connect(
+                app_state,
+                host_only.clone(),
+                referer,
+                user_agent,
+                client_addr,
+                fingerprint,
+            );
+            tracing::info!(host = %authority, "blocked connect request by rule (fingerprinted)");
+        }
+        Err(err) => {
+            tracing::debug!(target = %authority, error = %err, "upgrade failed for blocked connect capture");
+            record_blocked_connect(
+                app_state,
+                host_only.clone(),
+                referer,
+                user_agent,
+                client_addr,
+                FingerprintMetadata::default(),
+            );
+            tracing::info!(host = %authority, "blocked connect request by rule");
+        }
+    }
+}
+
+async fn capture_client_hello(mut upgraded: Upgraded) -> io::Result<FingerprintMetadata> {
+    let mut acceptor = Acceptor::default();
+    let mut buffer = [0u8; 4096];
+
+    loop {
+        let n = match upgraded.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) => return Err(err),
+        };
+
+        let mut cursor = Cursor::new(&buffer[..n]);
+        acceptor.read_tls(&mut cursor)?;
+
+        match acceptor.accept() {
+            Ok(Some(accepted)) => {
+                let metadata = extract_fingerprint(&accepted);
+                let _ = upgraded.shutdown().await;
+                return Ok(metadata);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let _ = upgraded.shutdown().await;
+                return Err(io::Error::new(io::ErrorKind::Other, err));
+            }
+        }
+
+        if n == buffer.len() {
+            break;
+        }
+    }
+
+    let _ = upgraded.shutdown().await;
+    Ok(FingerprintMetadata::default())
+}
+
+fn extract_fingerprint(accepted: &Accepted) -> FingerprintMetadata {
+    let client_hello = accepted.client_hello();
+    let sni = client_hello.server_name().map(|name| name.to_string());
+    let alpn = client_hello
+        .alpn()
+        .map(|iter| iter.map(|proto| String::from_utf8_lossy(proto).into_owned()).collect())
+        .unwrap_or_default();
+
+    FingerprintMetadata { sni, alpn }
+}
+
+fn record_allowed_event(
+    state: &Arc<AppState>,
+    method: String,
+    domain: String,
+    path: String,
+    status: u16,
+    rewritten: bool,
+    referer: Option<String>,
+    user_agent: Option<String>,
+    client_addr: SocketAddr,
+) {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+
+    let event = AllowedEvent {
+        id: format!("allow-{}", now),
+        timestamp: now,
+        method,
+        domain,
+        path,
+        status,
+        rewritten,
+        referer,
+        user_agent,
+        client_ip: Some(client_addr.ip().to_string()),
+        client_port: Some(client_addr.port()),
+    };
+
+    if let Ok(mut buf) = state.recent_allowed.lock() {
+        if buf.len() == buf.capacity() {
+            buf.pop_front();
+        }
+        buf.push_back(event);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -628,6 +850,7 @@ async fn handle_tls_intercept(
     ca_store: Arc<CaStore>,
     allow_insecure_upstream: bool,
     app_state: Option<Arc<AppState>>,
+    client_addr: SocketAddr,
 ) -> Result<(), InterceptError> {
     tracing::debug!(host = %authority, "attempting tls interception");
 
@@ -683,6 +906,7 @@ async fn handle_tls_intercept(
     let rules_arc = rules.clone();
     let rewrites_arc = rewrite_rules.clone();
     let app_state_arc = app_state.clone();
+    let client_addr_arc = client_addr;
     let service = service_fn(move |req| {
         handle_mitm_request(
             req,
@@ -692,6 +916,7 @@ async fn handle_tls_intercept(
             host_arc.clone(),
             rewrites_arc.clone(),
             app_state_arc.clone(),
+            client_addr_arc,
         )
     });
 
@@ -713,6 +938,7 @@ async fn handle_mitm_request(
     host_only: Arc<String>,
     rewrite_rules: Arc<RewriteRules>,
     app_state: Option<Arc<AppState>>,
+    client_addr: SocketAddr,
 ) -> Result<Response<Body>, hyper::Error> {
     if let Some(state) = app_state.as_ref() {
         state.requests_total.fetch_add(1, Ordering::Relaxed);
@@ -721,20 +947,24 @@ async fn handle_mitm_request(
     let path = req
         .uri()
         .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let method_str = req.method().to_string();
 
-    if rules.should_block(&host_only, path) {
-        let referer = req
-            .headers()
-            .get(REFERER)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let user_agent = req
-            .headers()
-            .get(USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+    let referer_header = req
+        .headers()
+        .get(REFERER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let user_agent_header = req
+        .headers()
+        .get(USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    if rules.should_block(&host_only, path.as_str()) {
+        let referer = referer_header.clone();
+        let user_agent = user_agent_header.clone();
 
         if let Some(state) = app_state.as_ref() {
             state.blocked_total.fetch_add(1, Ordering::Relaxed);
@@ -756,6 +986,10 @@ async fn handle_mitm_request(
                 reason: Some("blocked by rule".to_string()),
                 referer,
                 user_agent,
+                client_ip: Some(client_addr.ip().to_string()),
+                client_port: Some(client_addr.port()),
+                tls_sni: None,
+                tls_alpn: Vec::new(),
             };
 
             if let Ok(mut buf) = state.recent_blocked.lock() {
@@ -815,6 +1049,7 @@ async fn handle_mitm_request(
         .rewrite_response(host_only.as_str(), response)
         .await;
     let rewrote = rewritten.headers().get(REWRITTEN_HEADER).is_some();
+    let status_code = rewritten.status().as_u16();
 
     if let Some(state) = app_state.as_ref() {
         state.allowed_total.fetch_add(1, Ordering::Relaxed);
@@ -839,6 +1074,18 @@ async fn handle_mitm_request(
         if rewrote {
             state.rewritten_total.fetch_add(1, Ordering::Relaxed);
         }
+
+        record_allowed_event(
+            state,
+            method_str,
+            host_only.as_str().to_string(),
+            path.clone(),
+            status_code,
+            rewrote,
+            referer_header.clone(),
+            user_agent_header.clone(),
+            client_addr,
+        );
     }
 
     if rewrote {
