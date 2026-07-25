@@ -6,7 +6,7 @@ use hyper::{
 };
 use lol_html::{HtmlRewriter, Settings, element};
 
-use crate::config::{HostRewrite, Replacement, RewriteConfig};
+use crate::config::{HostRewrite, NetworkPolicyConfig, Replacement, RewriteConfig};
 
 pub const REWRITTEN_HEADER: &str = "x-empathymachine-rewritten";
 
@@ -16,10 +16,18 @@ pub struct RewriteRules {
     global_replace: Vec<Replacement>,
     global_css: Vec<String>,
     hosts: HashMap<String, HostRewrite>,
+    /// When true, strip Alt-Svc response headers (and emit `Alt-Svc: clear`)
+    /// so clients can't discover HTTP/3 over QUIC and bypass EM's
+    /// HTTP-over-TCP inspection. See DESIGN.md §4 motivating example.
+    block_quic: bool,
 }
 
 impl RewriteRules {
     pub fn from_config(config: &RewriteConfig) -> Self {
+        Self::from_configs(config, &NetworkPolicyConfig::default())
+    }
+
+    pub fn from_configs(config: &RewriteConfig, network_policy: &NetworkPolicyConfig) -> Self {
         let mut hosts = HashMap::new();
         for (host, rule) in &config.hosts {
             hosts.insert(host.to_ascii_lowercase(), rule.clone());
@@ -41,6 +49,7 @@ impl RewriteRules {
             global_replace,
             global_css,
             hosts,
+            block_quic: network_policy.block_quic,
         }
     }
 
@@ -55,6 +64,10 @@ impl RewriteRules {
     }
 
     pub async fn rewrite_response(&self, host: &str, response: Response<Body>) -> Response<Body> {
+        // Header-only transformations apply to ALL responses (not just HTML)
+        // and ALL hosts (no per-host opt-in needed).
+        let response = self.apply_header_transforms(response);
+
         let selectors = self.selectors_for(host);
         let replacements = self.replacements_for(host);
         let css_rules = self.css_rules_for(host);
@@ -194,6 +207,24 @@ impl RewriteRules {
             .insert(REWRITTEN_HEADER, HeaderValue::from_static("1"));
 
         Response::from_parts(parts, Body::from(output))
+    }
+
+    /// Apply header-only transformations to a response. Runs on every
+    /// response (HTML or not, every host) — no opt-in needed because each
+    /// transform is gated by a top-level network_policy flag.
+    fn apply_header_transforms(&self, mut response: Response<Body>) -> Response<Body> {
+        if self.block_quic {
+            let headers = response.headers_mut();
+            // Drop all Alt-Svc advertisements (http::HeaderMap is
+            // case-insensitive on names, so this catches "Alt-Svc" and
+            // "alt-svc" alike) — clients can't discover QUIC.
+            headers.remove("alt-svc");
+            // Replace with Alt-Svc: clear so any cached alt-svc entries
+            // the client may have for this host are invalidated.
+            // RFC 7838 §4: "alt-svc: clear" empties the alt-svc cache.
+            headers.insert("alt-svc", HeaderValue::from_static("clear"));
+        }
+        response
     }
 
     fn selectors_for(&self, host: &str) -> Vec<String> {

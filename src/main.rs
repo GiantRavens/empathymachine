@@ -116,7 +116,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let rewrite_rules = RewriteRules::from_config(&config.rewrites);
+    let rewrite_rules = RewriteRules::from_configs(&config.rewrites, &config.network_policy);
 
     let proxy = ProxyServer::with_tls_and_state(
         bind_addr,

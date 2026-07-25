@@ -26,6 +26,21 @@ pub struct Config {
     pub rewrites: RewriteConfig,
     #[serde(default)]
     pub dns: DnsConfig,
+    #[serde(default)]
+    pub network_policy: NetworkPolicyConfig,
+}
+
+/// Network-layer policy decisions compiled from policy.yaml by `mm policy`
+/// commands. Captain-facing reasoning lives in policy.yaml; this struct
+/// holds the runtime flags the Rust binary actually consumes.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct NetworkPolicyConfig {
+    /// When true: strip Alt-Svc response headers so clients can't discover
+    /// HTTP/3 over QUIC and silently bypass EM's HTTP-over-TCP inspection.
+    /// Browsers fall back to HTTPS/TCP, EM keeps full visibility.
+    /// See DESIGN.md §4 for the motivating example + reasoning trace.
+    #[serde(default)]
+    pub block_quic: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -147,6 +162,7 @@ impl Default for Config {
             sources: Vec::new(),
             tls: TlsConfig::default(),
             rewrites: RewriteConfig::default(),
+            network_policy: NetworkPolicyConfig::default(),
             dns: DnsConfig::default(),
         }
     }

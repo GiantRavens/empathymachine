@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Template: install_tray.sh substitutes __HOME__ before install.
+
+         Tray app is a Python GUI program. It MUST live in ~/.empathymachine/
+         (not ~/Desktop) because LaunchAgents can't exec scripts under
+         macOS user-data dirs (TCC). The Python binary is the venv interpreter
+         at ~/.empathymachine/.venv/bin/python — also TCC-safe. -->
+
+    <key>Label</key>
+    <string>com.giantravens.empathymachine-tray</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.empathymachine/.venv/bin/python</string>
+        <string>__HOME__/.empathymachine/tray.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.empathymachine</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Tray must be in the GUI session to draw the menu bar item.
+         LimitLoadToSessionType=Aqua restricts it to logged-in GUI sessions. -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- KeepAlive on crash, not on clean exit (so "Quit Tray" from the
+         menu actually quits until user starts it again). -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/empathymachine-tray.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/empathymachine-tray.log</string>
+
+    <!-- Interactive process — needs normal scheduling so menu stays responsive. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

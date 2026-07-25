@@ -1,0 +1,103 @@
+# policy.yaml — captain's privacy/control decisions, with reasoning trace.
+#
+# Source of truth for what EmpathyMachine and its enforcement substrates
+# (Little Snitch, Pi-hole, router firewalls, iOS profiles, etc.) should do.
+# Substrate-agnostic by design — see DESIGN.md.
+#
+# Every entry follows the same shape:
+#
+#   <name>:
+#     value: true | false | string | object
+#     decided_at: ISO 8601 timestamp
+#     decided_by: "captain" | "captain via Claude" | "Claude (auto)"
+#     note: |
+#       Multi-line reasoning. Captures WHY this decision was made — the
+#       captured conversation, the trade-off considered, the priorities
+#       being honored. This is what git log policy.yaml replays over time.
+#     review_by: ISO 8601 — when to revisit this decision
+#     substrates: [em-rewriter, em-blocklist, ls, pi-hole, router, ...]
+#
+# To make changes:  mm policy set <name> <value> --note "..."
+# To see history:   git log policy.yaml
+# To find why X is blocked:  mm policy why <name-or-host>
+
+# === Network policy ===
+# Toggles that affect protocol/transport behavior. Compiles to runtime
+# flags in config.yaml's network_policy block on `mm policy compile`.
+
+network_policy:
+  block_quic:
+    value: true
+    decided_at: 2026-05-24T18:00:00Z
+    decided_by: "captain via Claude"
+    note: |
+      QUIC (HTTP/3 over UDP/443) bypasses EM's HTTP-over-TCP inspection
+      entirely. Every browser that upgrades to QUIC silently exits the
+      MITM tunnel — EM stops seeing the traffic. Blocking forces TCP
+      fallback (~1s detection + ~50ms latency on first load per host).
+
+      Captain prioritizes full inspection coverage over the latency cost.
+
+      Enforcement:
+        - EM rewriter strips `Alt-Svc` headers + emits `Alt-Svc: clear`
+          to invalidate cached entries (RFC 7838 §4).
+        - Future LSRules: deny outbound UDP/443 any-process for
+          belt-and-suspenders enforcement at the kernel layer.
+    review_by: 2026-11-24
+    substrates: [em-rewriter]
+
+# === Custom deny rules (any-process hostname blocks beyond stock blocklists) ===
+# Captain-curated additions to what gets blocked. Compiles to entries in
+# blocklists/policy_imports.txt (managed file; do not hand-edit).
+
+custom_deny_rules: []
+#   - host: example-tracker.com
+#     decided_at: ...
+#     note: "Why this was added"
+#     review_by: ...
+
+# === Custom allow rules (force-allow / bypass even if in a blocklist) ===
+# Compiles to additions to tls.bypass_hosts in config.yaml.
+
+custom_allow_rules: []
+#   - host: mybank.com
+#     decided_at: ...
+#     note: "Cert-pinned; must bypass MITM"
+
+# === Presentation policy ===
+# Per-site / per-pattern visual + content adjustments. See DESIGN.md §9.
+# Each entry compiles to config.yaml's rewrites + a managed blocklist file
+# (blocklists/policy_imports.txt) via `mm policy compile --apply`.
+#
+# Entries have an `apply:` block describing what to enforce:
+#   remove_selectors:  CSS selectors stripped from HTML at parse time
+#   css_hide_selectors: CSS selectors hidden via injected `{display:none}`
+#   block_hosts:       hostnames blocked at the proxy + DNS layer
+
+presentation_policy: {}
+#   block_anti_adblock_walls:
+#     value: true
+#     decided_at: ...
+#     decided_by: "captain via Claude"
+#     note: |
+#       Why this decision was made — captured reasoning.
+#     review_by: ...
+#     substrates: [em-rewriter, em-blocklist]
+#     apply:
+#       remove_selectors:
+#         - 'script.pmc-admiral'
+#       css_hide_selectors:
+#         - '#DCDOr'
+#       block_hosts:
+#         - cdn.getadmiral.com
+#         - cloudguppy.com
+
+# === Anti-features (designed but not yet implemented) ===
+# See DESIGN.md §9 (presentation shaping curation/reframing) and §10
+# (dignity safeguards). Do not enable until the dignity-safeguard tooling
+# is built.
+
+# presentation_curation:
+#   suppress_topics: []     # e.g., "influencer culture", "celebrity gossip"
+# presentation_editorial_overlay:
+#   per_site: {}            # site → list of transformations (rewrite, flag claims, etc.)

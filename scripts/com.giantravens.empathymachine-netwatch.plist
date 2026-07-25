@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Template: install_launchd.sh substitutes __PROJECT_ROOT__ and __HOME__.
+
+         Watches macOS network/SystemConfiguration state changes (Wi-Fi flap,
+         Ethernet plug, primary-service change) and re-applies the user's
+         desired proxy state. State lives in state/proxy-desired.txt
+         (written by `mm proxy-on` / `mm proxy-off`).
+
+         Feedback-loop guard: launcher's `proxy-reapply` checks the CURRENT
+         OS proxy state and no-ops when desired == current, so a proxy-on
+         triggering a preferences.plist write doesn't recurse. ThrottleInterval
+         is a backstop. -->
+
+    <key>Label</key>
+    <string>com.giantravens.empathymachine-netwatch</string>
+
+    <!-- Points at the standalone reapply script installed at
+         ~/.empathymachine/em-proxy-reapply (NOT the main launcher under
+         ~/Desktop, which macOS TCC blocks LaunchAgents from exec'ing). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.empathymachine/em-proxy-reapply</string>
+    </array>
+
+    <!-- WorkingDirectory MUST be a non-TCC-protected path. ~/Desktop is
+         protected on macOS 13+; a shell-script agent starting there fails
+         bash's initial getcwd() with EPERM, before any code runs. /tmp is
+         always readable. The launcher tolerates this and uses absolute
+         paths internally where needed. -->
+    <key>WorkingDirectory</key>
+    <string>/tmp</string>
+
+    <!-- launchd doesn't always inherit HOME / PATH for shell-script agents.
+         set -u in the launcher errors on missing HOME; provide it explicitly. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Fire on system network config changes. preferences.plist is rewritten
+         when proxies, DNS, service order, or interface state change. -->
+    <key>WatchPaths</key>
+    <array>
+        <string>/Library/Preferences/SystemConfiguration/preferences.plist</string>
+        <string>/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist</string>
+    </array>
+
+    <!-- Also run once at load (after login) to align proxy state to desired. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Throttle reasonably aggressively — bursts of network events shouldn't
+         cause repeated networksetup calls. -->
+    <key>ThrottleInterval</key>
+    <integer>3</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/empathymachine-netwatch.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/empathymachine-netwatch.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

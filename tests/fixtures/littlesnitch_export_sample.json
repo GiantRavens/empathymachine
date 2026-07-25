@@ -1,0 +1,79 @@
+{
+  "$comment": "Synthetic LS export covering the rule shapes the importer should handle. Mix of LS 5 + LS 4 style fields, deny+allow+ask, any-process + per-process, valid hosts + IPs + wildcards + bogus values.",
+  "rules": [
+    {
+      "action": "deny",
+      "process": "Any Process",
+      "remote-hosts": ["doubleclick.net"],
+      "direction": "outgoing"
+    },
+    {
+      "action": "deny",
+      "process": "Any Process",
+      "remote-host": "google-analytics.com"
+    },
+    {
+      "action": "deny",
+      "process": "Any Process",
+      "remote-hosts": ["scorecardresearch.com", "*.adsrvr.org"]
+    },
+    {
+      "action": "allow",
+      "process": "Any Process",
+      "remote-hosts": ["accounts.google.com"]
+    },
+    {
+      "action": "allow",
+      "process": "Any Process",
+      "remote-host": "*.icloud.com"
+    },
+    {
+      "action": "deny",
+      "process": "/Applications/Spotify.app/Contents/MacOS/Spotify",
+      "remote-hosts": ["spotify-analytics.example.com"]
+    },
+    {
+      "action": "deny",
+      "process": "/Applications/Slack.app/Contents/MacOS/Slack",
+      "remote-hosts": ["slack-telemetry.example.com"]
+    },
+    {
+      "action": "ask",
+      "process": "Any Process",
+      "remote-hosts": ["unsure-host.example.com"]
+    },
+    {
+      "action": "deny",
+      "process": "Any Process",
+      "remote-hosts": ["1.2.3.4"],
+      "$comment": "IP-only rule, importer should skip"
+    },
+    {
+      "action": "deny",
+      "process": "Any Process",
+      "remote-host": "any-domain",
+      "$comment": "Wildcard global deny, importer should skip"
+    },
+    {
+      "action": "deny",
+      "process": "Any Process",
+      "remote": {"host": "nested-deny.example.com"}
+    },
+    {
+      "action": "block",
+      "process": "Any Process",
+      "remoteHost": "altspelling-deny.example.com",
+      "$comment": "LS 4-era field name + 'block' synonym"
+    },
+    {
+      "action": "deny",
+      "$comment": "no host field at all — importer should count as skipped_no_host"
+    },
+    {
+      "verdict": "deny",
+      "process": "Any Process",
+      "remote-hosts": ["verdict-key-variant.example.com"],
+      "$comment": "alternate action key 'verdict'"
+    }
+  ]
+}

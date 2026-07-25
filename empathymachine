@@ -4,38 +4,670 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}" && pwd)"
 CARGO_MANIFEST="${PROJECT_ROOT}/Cargo.toml"
+RELEASE_BIN="${PROJECT_ROOT}/target/release/empathymachine"
+SERVICE_NAME="empathymachine.service"
+LAUNCHD_LABEL="com.giantravens.empathymachine"
+LAUNCHD_NETWATCH_LABEL="com.giantravens.empathymachine-netwatch"
+LAUNCHD_PLIST="${HOME}/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+LAUNCHD_LOG="${HOME}/Library/Logs/empathymachine.log"
+# State file lives in a TCC-safe location (~/.* is unrestricted on macOS).
+# The macOS netwatch LaunchAgent runs from /tmp without ~/Desktop access,
+# so the previous location at PROJECT_ROOT/state/ was unreadable to it.
+PROXY_DESIRED_FILE="${HOME}/.empathymachine/proxy-desired.txt"
+ADMIN_URL="${EMPATHYMACHINE_ADMIN_URL:-http://127.0.0.1:8081}"
+PROXY_HOST="${EMPATHYMACHINE_PROXY_HOST:-127.0.0.1}"
+PROXY_PORT="${EMPATHYMACHINE_PROXY_PORT:-8080}"
+# macOS: auto-detect active network service, or override
+MAC_NET_SERVICE="${EMPATHYMACHINE_MAC_SERVICE:-}"
 
-cd "${PROJECT_ROOT}" || {
-    echo "error: failed to change directory to ${PROJECT_ROOT}" >&2
-    exit 1
-}
+# Best-effort cd into PROJECT_ROOT. macOS TCC blocks LaunchAgents from
+# entering protected dirs like ~/Desktop; the netwatch agent runs proxy-reapply
+# which only needs networksetup/gsettings, no PROJECT_ROOT access. Other
+# commands (cargo build, refresh-blocklists, etc.) check cwd themselves
+# and will fail loudly if they actually need it.
+cd "${PROJECT_ROOT}" 2>/dev/null || true
 
 usage() {
     cat <<'EOF'
 Usage: empathymachine <command> [options]
 
-Commands:
-  start [--update-lists]    Run the proxy (optionally refresh blocklists first)
+Run commands:
+  start [--update-lists]    Run the proxy in the foreground (--update-lists refreshes first)
   refresh-blocklists        Fetch remote blocklists and exit
   dump-ca                   Print the root CA certificate PEM to stdout
+  build                     cargo build --release + ad-hoc codesign on macOS (use instead
+                            of cargo directly so LS prompts don't return after rebuild)
 
-Any additional arguments after "--" are passed through to `cargo run`.
+Process control (via systemd --user when unit is installed; fallback otherwise):
+  status                    Show proxy state, listen addrs, recent metrics
+  stop                      Stop the running proxy
+  restart                   Restart the running proxy
+  logs                      Tail recent log lines (systemd journal or stdout)
+
+Cert lifecycle:
+  install-cert              Trust root_ca.pem in OS trust store (+ Firefox NSS if present)
+  uninstall-cert            Reverse of install-cert
+
+System proxy toggle (routes all HTTP/HTTPS through 127.0.0.1:8080):
+  proxy-on                  Turn the system proxy ON (Mac: networksetup; Linux: gsettings/kwriteconfig)
+  proxy-off                 Turn the system proxy OFF
+  proxy-status              Show the current OS-level proxy setting
+  proxy-reapply             Re-apply desired proxy state (used by netwatch agent on Mac)
+
+Bypass list (sites that should skip TLS interception):
+  bypass <host>             Add host to tls.bypass_hosts in config.yaml and restart
+  unbypass <host>           Remove host from tls.bypass_hosts and restart
+  bypass-list               Print every host currently in the bypass list
+
+Imports:
+  import-littlesnitch <ls-export.json> [--apply] [--restart]
+                            Bring Little Snitch deny rules in as a blocklist
+                            (dry-run by default; --inspect to debug parser)
+
+Knowledge:
+  explain <host>            Look up owner / category / tracker classification
+                            / breakage impact / suggested verdict for a host
+                            (DuckDuckGo Tracker Radar + LLM fallback)
+  explain --refresh-data    Re-download DDG Tracker Radar dataset
+
+Policy (captain's decisions with reasoning trace — see DESIGN.md):
+  policy show [<name>]      Summary of every entry, or full reasoning for one
+  policy set <name> <value> --note "..."
+                            Create/update an entry (reasoning required)
+  policy compile [--apply] [--restart]
+                            Propagate policy.yaml decisions → config.yaml
+  policy why <name>         Show captured reasoning for one decision
+  policy review             List entries past their review_by date
+
+Environment overrides:
+  EMPATHYMACHINE_CARGO_CMD     Use a custom cargo (test mode forces cargo-run path)
+  EMPATHYMACHINE_ADMIN_URL     Admin HTTP base (default http://127.0.0.1:8081)
+  EMPATHYMACHINE_PROXY_HOST    Proxy host the OS points at (default 127.0.0.1)
+  EMPATHYMACHINE_PROXY_PORT    Proxy port the OS points at (default 8080)
+  EMPATHYMACHINE_MAC_SERVICE   macOS network service name (default: auto-detect)
 EOF
 }
 
+# ─── invocation primitives ────────────────────────────────────────────────
+
+# run_via_cargo: always uses `cargo run`. Honors EMPATHYMACHINE_CARGO_CMD for tests.
+run_via_cargo() {
+    local cargo_cmd="${EMPATHYMACHINE_CARGO_CMD:-cargo}"
+    if ! command -v "${cargo_cmd}" >/dev/null 2>&1 && [[ ! -x "${cargo_cmd}" ]]; then
+        echo "error: cargo is required (set EMPATHYMACHINE_CARGO_CMD or install Rust)" >&2
+        exit 1
+    fi
+    "${cargo_cmd}" run --manifest-path "${CARGO_MANIFEST}" -- "$@"
+}
+
+# run_binary_or_cargo: prefer the release binary when present; cargo-run otherwise.
+# In test mode (EMPATHYMACHINE_CARGO_CMD set) always use the cargo path so tests
+# observe the stub. This preserves the original launcher contract.
+run_binary_or_cargo() {
+    if [[ -n "${EMPATHYMACHINE_CARGO_CMD:-}" ]]; then
+        run_via_cargo "$@"
+        return
+    fi
+    if [[ -x "${RELEASE_BIN}" ]]; then
+        exec "${RELEASE_BIN}" "$@"
+    fi
+    echo "note: no release binary at ${RELEASE_BIN} — falling back to cargo run." >&2
+    echo "      Build once with: cargo build --release" >&2
+    run_via_cargo "$@"
+}
+
+# ─── systemd helpers ─────────────────────────────────────────────────────
+
+has_systemd_unit() {
+    # Avoid the pipefail-vs-SIGPIPE trap from `... | grep -q ...` by capturing
+    # the unit-file list first and substring-matching in-shell.
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+    local list
+    list=$(systemctl --user list-unit-files 2>/dev/null || true)
+    [[ "${list}" == *"${SERVICE_NAME}"* ]]
+}
+
+systemd_action() {
+    local action=$1
+    shift || true
+    systemctl --user "${action}" "${SERVICE_NAME}" "$@"
+}
+
+# ─── launchd helpers (macOS) ─────────────────────────────────────────────
+
+has_launchd_agent() {
+    [[ "$(uname -s)" == "Darwin" ]] || return 1
+    command -v launchctl >/dev/null 2>&1 || return 1
+    local list
+    list=$(launchctl list 2>/dev/null || true)
+    [[ "${list}" == *"${LAUNCHD_LABEL}"* ]] && return 0
+    # File present but not loaded — still consider "installed" so we route
+    # commands through launchctl instead of pgrep fallback.
+    [[ -f "${LAUNCHD_PLIST}" ]]
+}
+
+launchd_action() {
+    local action=$1
+    case "${action}" in
+        start)
+            launchctl load -w "${LAUNCHD_PLIST}" 2>/dev/null || \
+                launchctl kickstart "gui/$(id -u)/${LAUNCHD_LABEL}" ;;
+        stop)
+            # `unload` keeps it stopped across reboots; use `stop` for soft stop.
+            launchctl unload "${LAUNCHD_PLIST}" ;;
+        restart)
+            launchctl kickstart -k "gui/$(id -u)/${LAUNCHD_LABEL}" ;;
+        status)
+            launchctl list "${LAUNCHD_LABEL}" 2>/dev/null \
+                || echo "${LAUNCHD_LABEL}: not loaded" ;;
+    esac
+}
+
+# ─── commands ────────────────────────────────────────────────────────────
+
+cmd_start() {
+    local update_lists=false
+    declare -a pass_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --update-lists) update_lists=true; shift ;;
+            --) shift; pass_args+=("$@"); break ;;
+            *) pass_args+=("$1"); shift ;;
+        esac
+    done
+    if [[ "${update_lists}" == true ]]; then
+        # refresh first; do NOT exec so we can continue to the start phase
+        if [[ -z "${EMPATHYMACHINE_CARGO_CMD:-}" && -x "${RELEASE_BIN}" ]]; then
+            "${RELEASE_BIN}" --refresh-blocklists
+        else
+            run_via_cargo --refresh-blocklists
+        fi
+    fi
+    if [[ ${#pass_args[@]} -gt 0 ]]; then
+        run_binary_or_cargo "${pass_args[@]}"
+    else
+        run_binary_or_cargo
+    fi
+}
+
+cmd_refresh_blocklists() {
+    run_binary_or_cargo --refresh-blocklists "$@"
+}
+
+cmd_dump_ca() {
+    run_binary_or_cargo --dump-ca "$@"
+}
+
+cmd_status() {
+    if has_systemd_unit; then
+        systemd_action status --no-pager || true
+        echo
+    elif has_launchd_agent; then
+        launchd_action status
+        echo
+    else
+        if pgrep -f "target/.*/empathymachine" >/dev/null 2>&1; then
+            echo "empathymachine: RUNNING (foreground/unsupervised)"
+        else
+            echo "empathymachine: STOPPED"
+        fi
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        local status_json
+        if status_json=$(curl -sS --max-time 2 "${ADMIN_URL}/api/status" 2>/dev/null); then
+            echo "admin /api/status: ${status_json}"
+            local metrics_json
+            if metrics_json=$(curl -sS --max-time 2 "${ADMIN_URL}/api/metrics" 2>/dev/null); then
+                echo "admin /api/metrics: ${metrics_json}"
+            fi
+        else
+            echo "admin (${ADMIN_URL}) not reachable"
+        fi
+    fi
+}
+
+cmd_stop() {
+    if has_systemd_unit; then
+        systemd_action stop
+    elif has_launchd_agent; then
+        launchd_action stop
+        echo "empathymachine: stopped (launchd)"
+    else
+        local pids
+        pids=$(pgrep -f "target/.*/empathymachine" || true)
+        if [[ -z "${pids}" ]]; then
+            echo "empathymachine: not running"
+            return 0
+        fi
+        echo "stopping empathymachine (pids: ${pids})"
+        kill ${pids}
+    fi
+}
+
+cmd_restart() {
+    if has_systemd_unit; then
+        systemd_action restart
+    elif has_launchd_agent; then
+        launchd_action restart
+        echo "empathymachine: kickstarted (launchd)"
+    else
+        cmd_stop || true
+        sleep 1
+        echo "empathymachine: relaunching in background..." >&2
+        nohup "${RELEASE_BIN}" >/tmp/empathymachine.log 2>&1 &
+    fi
+}
+
+cmd_logs() {
+    if has_systemd_unit; then
+        journalctl --user -u "${SERVICE_NAME}" -n 200 --no-pager "$@"
+    elif has_launchd_agent; then
+        if [[ -f "${LAUNCHD_LOG}" ]]; then
+            tail -n 200 "${LAUNCHD_LOG}"
+        else
+            echo "no log at ${LAUNCHD_LOG} yet — service may not have started" >&2
+            exit 1
+        fi
+    else
+        if [[ -f /tmp/empathymachine.log ]]; then
+            tail -n 200 /tmp/empathymachine.log
+        else
+            echo "no log source: install the systemd unit or launchd plist via scripts/" >&2
+            exit 1
+        fi
+    fi
+}
+
+cmd_install_cert() {
+    local pem="${PROJECT_ROOT}/certs/root_ca.pem"
+    if [[ ! -f "${pem}" ]]; then
+        echo "no CA at ${pem} — run './empathymachine start' once to generate it" >&2
+        exit 1
+    fi
+    bash "${PROJECT_ROOT}/scripts/install_cert.sh" "$@"
+}
+
+cmd_uninstall_cert() {
+    bash "${PROJECT_ROOT}/scripts/install_cert.sh" --uninstall "$@"
+}
+
+# ─── system proxy toggle ─────────────────────────────────────────────────
+
+# Detect macOS network service that's actually carrying the default route.
+# Priority order from `networksetup -listnetworkserviceorder` is NOT the same
+# as the active route — USB-Ethernet can be #1 in order but Wi-Fi is what's
+# actually routing if the dongle has no carrier. We read `route get default`
+# to find the live interface, then map that interface to its service name
+# via `listallhardwareports`. Honors EMPATHYMACHINE_MAC_SERVICE override.
+detect_mac_service() {
+    if [[ -n "${MAC_NET_SERVICE}" ]]; then
+        echo "${MAC_NET_SERVICE}"
+        return 0
+    fi
+    local iface svc
+    iface=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2; exit}')
+    if [[ -n "${iface}" ]]; then
+        svc=$(networksetup -listallhardwareports 2>/dev/null | awk -v iface="${iface}" '
+            /^Hardware Port:/ { port = substr($0, index($0, $3)) }
+            $1 == "Device:" && $2 == iface { print port; exit }
+        ')
+        if [[ -n "${svc}" ]]; then
+            echo "${svc}"
+            return 0
+        fi
+    fi
+    # Fallback: first enabled service in priority order (legacy behavior).
+    networksetup -listnetworkserviceorder 2>/dev/null \
+        | awk '/^\([0-9]+\)/ { gsub(/^\([0-9]+\) /, ""); print; exit }'
+}
+
+# Detect Linux desktop env for proxy backend choice. Returns: gnome | kde | unknown.
+# Prefers XDG_CURRENT_DESKTOP when set; falls back to probing whether the
+# relevant config tools actually work (tmux/SSH sessions often lack XDG vars
+# but can still reach dconf/gsettings via the running session bus).
+detect_linux_desktop() {
+    local de="${XDG_CURRENT_DESKTOP:-}"
+    case "${de,,}" in
+        *gnome*|*unity*|*pantheon*|*cinnamon*|*mate*|*budgie*) echo gnome; return ;;
+        *kde*|*plasma*) echo kde; return ;;
+    esac
+    # Probe path: gsettings works iff dconf/dbus is reachable
+    if command -v gsettings >/dev/null 2>&1 \
+        && gsettings get org.gnome.system.proxy mode >/dev/null 2>&1; then
+        echo gnome; return
+    fi
+    if command -v kwriteconfig6 >/dev/null 2>&1 \
+        || command -v kwriteconfig5 >/dev/null 2>&1; then
+        echo kde; return
+    fi
+    echo unknown
+}
+
+# Gnome family — uses gsettings (org.gnome.system.proxy schema).
+gnome_proxy_set() {
+    gsettings set org.gnome.system.proxy mode 'manual'
+    gsettings set org.gnome.system.proxy.http host "${PROXY_HOST}"
+    gsettings set org.gnome.system.proxy.http port "${PROXY_PORT}"
+    gsettings set org.gnome.system.proxy.https host "${PROXY_HOST}"
+    gsettings set org.gnome.system.proxy.https port "${PROXY_PORT}"
+    # Also configure SOCKS slot so apps that only read socks see something sane
+    gsettings set org.gnome.system.proxy.socks host "${PROXY_HOST}"
+    gsettings set org.gnome.system.proxy.socks port "${PROXY_PORT}"
+}
+
+gnome_proxy_unset() {
+    gsettings set org.gnome.system.proxy mode 'none'
+}
+
+gnome_proxy_status() {
+    local mode http_host http_port
+    mode=$(gsettings get org.gnome.system.proxy mode 2>/dev/null)
+    http_host=$(gsettings get org.gnome.system.proxy.http host 2>/dev/null)
+    http_port=$(gsettings get org.gnome.system.proxy.http port 2>/dev/null)
+    echo "GNOME proxy mode: ${mode}"
+    echo "GNOME http proxy: ${http_host}:${http_port}"
+}
+
+# KDE — kwriteconfig5 / 6 against kioslaverc. Tools vary by distro.
+kde_kwrite() {
+    if command -v kwriteconfig6 >/dev/null 2>&1; then
+        kwriteconfig6 --file kioslaverc "$@"
+    elif command -v kwriteconfig5 >/dev/null 2>&1; then
+        kwriteconfig5 --file kioslaverc "$@"
+    else
+        echo "warning: kwriteconfig5/6 not found — KDE proxy not changed" >&2
+        return 1
+    fi
+}
+
+kde_proxy_set() {
+    kde_kwrite --group 'Proxy Settings' --key ProxyType 1
+    kde_kwrite --group 'Proxy Settings' --key httpProxy "http://${PROXY_HOST}:${PROXY_PORT}"
+    kde_kwrite --group 'Proxy Settings' --key httpsProxy "http://${PROXY_HOST}:${PROXY_PORT}"
+}
+
+kde_proxy_unset() {
+    kde_kwrite --group 'Proxy Settings' --key ProxyType 0
+}
+
+kde_proxy_status() {
+    local kread
+    if command -v kreadconfig6 >/dev/null 2>&1; then
+        kread=kreadconfig6
+    elif command -v kreadconfig5 >/dev/null 2>&1; then
+        kread=kreadconfig5
+    else
+        echo "kreadconfig5/6 not available"; return
+    fi
+    echo "KDE ProxyType: $(${kread} --file kioslaverc --group 'Proxy Settings' --key ProxyType)"
+    echo "KDE httpProxy: $(${kread} --file kioslaverc --group 'Proxy Settings' --key httpProxy)"
+}
+
+# macOS — networksetup against the active service.
+mac_proxy_set() {
+    local svc
+    svc=$(detect_mac_service)
+    if [[ -z "${svc}" ]]; then
+        echo "error: could not auto-detect macOS network service" >&2
+        echo "       override with EMPATHYMACHINE_MAC_SERVICE='Wi-Fi'" >&2
+        return 1
+    fi
+    echo "→ targeting macOS network service: ${svc}"
+    networksetup -setwebproxy       "${svc}" "${PROXY_HOST}" "${PROXY_PORT}"
+    networksetup -setsecurewebproxy "${svc}" "${PROXY_HOST}" "${PROXY_PORT}"
+}
+
+mac_proxy_unset() {
+    local svc
+    svc=$(detect_mac_service)
+    if [[ -z "${svc}" ]]; then
+        echo "error: could not auto-detect macOS network service" >&2
+        return 1
+    fi
+    echo "→ targeting macOS network service: ${svc}"
+    networksetup -setwebproxystate       "${svc}" off
+    networksetup -setsecurewebproxystate "${svc}" off
+}
+
+mac_proxy_status() {
+    local svc
+    svc=$(detect_mac_service)
+    if [[ -z "${svc}" ]]; then
+        echo "(no active network service detected)"; return
+    fi
+    echo "service: ${svc}"
+    networksetup -getwebproxy "${svc}"
+    networksetup -getsecurewebproxy "${svc}"
+}
+
+_write_proxy_desired() {
+    mkdir -p "$(dirname "${PROXY_DESIRED_FILE}")"
+    echo "$1" > "${PROXY_DESIRED_FILE}"
+}
+
+_read_proxy_desired() {
+    if [[ -f "${PROXY_DESIRED_FILE}" ]]; then
+        cat "${PROXY_DESIRED_FILE}"
+    else
+        echo "off"
+    fi
+}
+
+# Returns "on" or "off" — current OS-level proxy state. Used by proxy-reapply
+# to skip work when desired == current (prevents feedback loop with the
+# netwatch agent triggering on its own networksetup writes).
+_current_proxy_state() {
+    local os; os="$(uname -s)"
+    case "${os}" in
+        Darwin)
+            local svc; svc=$(detect_mac_service)
+            [[ -z "${svc}" ]] && { echo "off"; return; }
+            local enabled
+            enabled=$(networksetup -getwebproxy "${svc}" 2>/dev/null \
+                      | awk -F': ' '/^Enabled:/ {print $2; exit}')
+            [[ "${enabled}" == "Yes" ]] && echo "on" || echo "off"
+            ;;
+        Linux)
+            local de; de=$(detect_linux_desktop)
+            if [[ "${de}" == "gnome" ]]; then
+                local mode
+                mode=$(gsettings get org.gnome.system.proxy mode 2>/dev/null | tr -d "'\"")
+                [[ "${mode}" == "manual" ]] && echo "on" || echo "off"
+            else
+                echo "off"
+            fi ;;
+        *) echo "off" ;;
+    esac
+}
+
+cmd_proxy_on() {
+    local os; os="$(uname -s)"
+    case "${os}" in
+        Darwin) mac_proxy_set ;;
+        Linux)
+            local de; de=$(detect_linux_desktop)
+            case "${de}" in
+                gnome)   gnome_proxy_set ;;
+                kde)     kde_proxy_set ;;
+                unknown)
+                    echo "unknown desktop (XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-})" >&2
+                    echo "Set your browser's proxy to http://${PROXY_HOST}:${PROXY_PORT} manually." >&2
+                    return 1 ;;
+            esac ;;
+        *) echo "unsupported OS: ${os}" >&2; return 1 ;;
+    esac
+    _write_proxy_desired "on"
+    echo "✓ system proxy → ${PROXY_HOST}:${PROXY_PORT}"
+    echo "  (some apps cache proxy at start; restart browsers if traffic isn't routing)"
+}
+
+cmd_proxy_off() {
+    local os; os="$(uname -s)"
+    case "${os}" in
+        Darwin) mac_proxy_unset ;;
+        Linux)
+            local de; de=$(detect_linux_desktop)
+            case "${de}" in
+                gnome)   gnome_proxy_unset ;;
+                kde)     kde_proxy_unset ;;
+                unknown)
+                    echo "unknown desktop — unset your browser's proxy manually." >&2
+                    return 1 ;;
+            esac ;;
+        *) echo "unsupported OS: ${os}" >&2; return 1 ;;
+    esac
+    _write_proxy_desired "off"
+    echo "✓ system proxy disabled"
+}
+
+# Called by the macOS netwatch launchd agent on network-state changes.
+# Reads the user's desired state and reconciles, no-op if already matched.
+cmd_proxy_reapply() {
+    local desired current
+    desired=$(_read_proxy_desired)
+    current=$(_current_proxy_state)
+    if [[ "${desired}" == "${current}" ]]; then
+        # Quiet no-op — agent fires on every preferences.plist change, most
+        # of which don't need action. Log only when we actually do something.
+        return 0
+    fi
+    if [[ "${desired}" == "on" ]]; then
+        echo "[netwatch] desired=on current=off — re-applying proxy"
+        cmd_proxy_on
+    else
+        echo "[netwatch] desired=off current=on — clearing proxy"
+        cmd_proxy_off
+    fi
+}
+
+cmd_bypass() {
+    if [[ $# -lt 1 ]]; then
+        echo "usage: empathymachine bypass <host>" >&2
+        return 1
+    fi
+    python3 "${PROJECT_ROOT}/scripts/edit_config_bypass.py" add "$1" || return $?
+    echo "→ restarting to pick up new bypass entry..."
+    cmd_restart
+}
+
+cmd_unbypass() {
+    if [[ $# -lt 1 ]]; then
+        echo "usage: empathymachine unbypass <host>" >&2
+        return 1
+    fi
+    python3 "${PROJECT_ROOT}/scripts/edit_config_bypass.py" remove "$1" || return $?
+    echo "→ restarting to pick up bypass removal..."
+    cmd_restart
+}
+
+cmd_bypass_list() {
+    python3 "${PROJECT_ROOT}/scripts/edit_config_bypass.py" list
+}
+
+cmd_build() {
+    # Wraps `cargo build --release` so the post-build codesign step on macOS
+    # is impossible to forget. Without it, Little Snitch reverts to
+    # per-destination prompts because LS refuses to apply broad "any process"
+    # rules to unsigned binaries. On Linux this is a no-op after the build.
+    require_cargo
+    "${EMPATHYMACHINE_CARGO_CMD:-cargo}" build --release --manifest-path "${CARGO_MANIFEST}" "$@"
+    if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+        if codesign --sign - --force "${RELEASE_BIN}" 2>/dev/null; then
+            local cdhash
+            cdhash=$(codesign -dvvv "${RELEASE_BIN}" 2>&1 | awk -F= '/^CDHash=/ {print $2; exit}')
+            echo "✓ ad-hoc signed binary (CDHash: ${cdhash:-<unknown>})"
+        else
+            echo "  (codesign skipped — non-fatal; LS will prompt per-destination)" >&2
+        fi
+    fi
+}
+
 require_cargo() {
-    if ! command -v cargo >/dev/null 2>&1; then
-        echo "error: cargo is required to run empathymachine" >&2
+    local cmd="${EMPATHYMACHINE_CARGO_CMD:-cargo}"
+    if ! command -v "${cmd}" >/dev/null 2>&1 && [[ ! -x "${cmd}" ]]; then
+        echo "error: cargo not found (install Rust or set EMPATHYMACHINE_CARGO_CMD)" >&2
         exit 1
     fi
 }
 
-run_cargo() {
-    require_cargo
-    local cargo_cmd
-    cargo_cmd="${EMPATHYMACHINE_CARGO_CMD:-cargo}"
-    "${cargo_cmd}" run --manifest-path "${CARGO_MANIFEST}" -- "$@"
+cmd_policy() {
+    if [[ $# -lt 1 ]]; then
+        cat <<EOF >&2
+usage: empathymachine policy <subcommand> [args]
+
+Subcommands:
+  show [<name>]            summary, or full entry for one decision
+  set <name> <value> --note "..."   create/update an entry (reasoning required)
+  compile [--apply] [--restart]     propagate policy.yaml → config.yaml runtime
+  why <name>               show reasoning trace for one decision
+  review                   list entries past their review_by date
+
+policy.yaml is the source of truth for captain's privacy/control decisions
+with reasoning trace. See DESIGN.md sections 2 + 4 + 5.
+
+Requires PyYAML (try .venv-mcp/bin/python if system python lacks it).
+EOF
+        return 1
+    fi
+    # Prefer .venv-mcp's python (has PyYAML via the mcp install path)
+    local py="${PROJECT_ROOT}/.venv-mcp/bin/python"
+    [[ -x "${py}" ]] || py="python3"
+    "${py}" "${PROJECT_ROOT}/scripts/policy.py" "$@"
 }
+
+cmd_explain() {
+    if [[ $# -lt 1 ]]; then
+        cat <<EOF >&2
+usage: empathymachine explain <host> [--json] [--no-llm]
+       empathymachine explain --refresh-data
+
+Explains a hostname using the DuckDuckGo Tracker Radar dataset, with an
+optional LLM fallback (Anthropic API via ANTHROPIC_API_KEY, or local
+Ollama at 127.0.0.1:11434) for hosts DDG doesn't classify.
+
+First-time use auto-downloads the DDG dataset to ~/.empathymachine/.
+EOF
+        return 1
+    fi
+    python3 "${PROJECT_ROOT}/scripts/explain_host.py" "$@"
+}
+
+cmd_import_littlesnitch() {
+    if [[ $# -lt 1 ]]; then
+        cat <<EOF >&2
+usage: empathymachine import-littlesnitch <ls-export.json> [--apply] [--restart] [--inspect]
+
+Imports deny-any-process rules from a Little Snitch JSON export into
+blocklists/littlesnitch_imports.txt, and registers that file in config.yaml.
+Default is dry-run; pass --apply to write. See scripts/import_littlesnitch.py
+for details (--inspect dumps export shape for parser debugging).
+
+To export rules from Little Snitch: open the LS app → File → Export Rules…
+→ choose "JSON" format → save the .json somewhere → pass that path here.
+EOF
+        return 1
+    fi
+    python3 "${PROJECT_ROOT}/scripts/import_littlesnitch.py" "$@"
+}
+
+cmd_proxy_status() {
+    local os; os="$(uname -s)"
+    case "${os}" in
+        Darwin) mac_proxy_status ;;
+        Linux)
+            local de; de=$(detect_linux_desktop)
+            case "${de}" in
+                gnome)   gnome_proxy_status ;;
+                kde)     kde_proxy_status ;;
+                unknown) echo "unknown desktop (XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-}); cannot read system proxy" ;;
+            esac ;;
+        *) echo "unsupported OS: ${os}" ;;
+    esac
+}
+
+# ─── dispatch ────────────────────────────────────────────────────────────
 
 if [[ $# -lt 1 ]]; then
     usage >&2
@@ -46,49 +678,26 @@ COMMAND=$1
 shift
 
 case "${COMMAND}" in
-    start)
-        UPDATE_LISTS=false
-        declare -a PASS_ARGS=()
-        while [[ $# -gt 0 ]]; do
-            case "$1" in
-                --update-lists)
-                    UPDATE_LISTS=true
-                    shift
-                    ;;
-                --)
-                    shift
-                    PASS_ARGS+=("$@")
-                    break
-                    ;;
-                *)
-                    PASS_ARGS+=("$1")
-                    shift
-                    ;;
-            esac
-        done
-
-        if [[ "${UPDATE_LISTS}" == true ]]; then
-            run_cargo --refresh-blocklists
-        fi
-
-        if [[ ${#PASS_ARGS[@]} -gt 0 ]]; then
-            run_cargo "${PASS_ARGS[@]}"
-        else
-            run_cargo
-        fi
-        ;;
-    refresh-blocklists)
-        run_cargo --refresh-blocklists "$@"
-        ;;
-    dump-ca)
-        run_cargo --dump-ca "$@"
-        ;;
-    --help|-h|help)
-        usage
-        ;;
-    *)
-        echo "error: unknown command '${COMMAND}'" >&2
-        usage >&2
-        exit 1
-        ;;
+    start)              cmd_start "$@" ;;
+    refresh-blocklists) cmd_refresh_blocklists "$@" ;;
+    dump-ca)            cmd_dump_ca "$@" ;;
+    status)             cmd_status "$@" ;;
+    stop)               cmd_stop "$@" ;;
+    restart)            cmd_restart "$@" ;;
+    logs)               cmd_logs "$@" ;;
+    install-cert)       cmd_install_cert "$@" ;;
+    uninstall-cert)     cmd_uninstall_cert "$@" ;;
+    proxy-on)           cmd_proxy_on "$@" ;;
+    proxy-off)          cmd_proxy_off "$@" ;;
+    proxy-status)       cmd_proxy_status "$@" ;;
+    proxy-reapply)      cmd_proxy_reapply "$@" ;;
+    bypass)             cmd_bypass "$@" ;;
+    unbypass)           cmd_unbypass "$@" ;;
+    bypass-list)        cmd_bypass_list "$@" ;;
+    import-littlesnitch) cmd_import_littlesnitch "$@" ;;
+    explain)            cmd_explain "$@" ;;
+    policy)             cmd_policy "$@" ;;
+    build)              cmd_build "$@" ;;
+    --help|-h|help)     usage ;;
+    *)                  echo "error: unknown command '${COMMAND}'" >&2; usage >&2; exit 1 ;;
 esac

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Standalone proxy-reapply script. Self-contained — does not depend on the
+# main launcher, PROJECT_ROOT, or any file under ~/Desktop. macOS TCC blocks
+# LaunchAgents from exec'ing files in ~/Desktop, so this script lives at
+# ~/.empathymachine/em-proxy-reapply (installed by install_launchd.sh) and
+# is what the netwatch LaunchAgent calls.
+#
+# Reads desired state from ~/.empathymachine/proxy-desired.txt and
+# reconciles via `networksetup`. No-ops when current == desired (prevents
+# feedback loop from networksetup writes triggering the WatchPaths agent).
+set -uo pipefail
+
+STATE_FILE="${HOME}/.empathymachine/proxy-desired.txt"
+PROXY_HOST="${EMPATHYMACHINE_PROXY_HOST:-127.0.0.1}"
+PROXY_PORT="${EMPATHYMACHINE_PROXY_PORT:-8080}"
+LOG_TAG="[em-proxy-reapply]"
+
+# Read desired state (default "off" if file missing).
+desired="off"
+if [[ -f "${STATE_FILE}" ]]; then
+    desired=$(cat "${STATE_FILE}" 2>/dev/null | tr -d '[:space:]')
+fi
+
+# Detect active macOS network service via default-route interface.
+iface=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2; exit}')
+svc=""
+if [[ -n "${iface}" ]]; then
+    svc=$(networksetup -listallhardwareports 2>/dev/null | awk -v iface="${iface}" '
+        /^Hardware Port:/ { port = substr($0, index($0, $3)) }
+        $1 == "Device:" && $2 == iface { print port; exit }
+    ')
+fi
+if [[ -z "${svc}" ]]; then
+    echo "${LOG_TAG} no active network service detected; exiting"
+    exit 0
+fi
+
+# Read current proxy state.
+current="off"
+enabled=$(networksetup -getwebproxy "${svc}" 2>/dev/null \
+          | awk -F': ' '/^Enabled:/ {print $2; exit}')
+[[ "${enabled}" == "Yes" ]] && current="on"
+
+# No-op when already matched (this is the feedback-loop guard).
+if [[ "${desired}" == "${current}" ]]; then
+    exit 0
+fi
+
+if [[ "${desired}" == "on" ]]; then
+    echo "${LOG_TAG} service=${svc} desired=on current=off — enabling proxy"
+    networksetup -setwebproxy       "${svc}" "${PROXY_HOST}" "${PROXY_PORT}"
+    networksetup -setsecurewebproxy "${svc}" "${PROXY_HOST}" "${PROXY_PORT}"
+else
+    echo "${LOG_TAG} service=${svc} desired=off current=on — clearing proxy"
+    networksetup -setwebproxystate       "${svc}" off
+    networksetup -setsecurewebproxystate "${svc}" off
+fi

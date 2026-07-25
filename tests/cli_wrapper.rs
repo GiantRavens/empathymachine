@@ -69,7 +69,7 @@ fn read_calls(log_path: &PathBuf) -> Vec<Vec<String>> {
 
 fn run_wrapper(args: &[&str]) -> Vec<Vec<String>> {
     let root = project_root();
-    let wrapper = root.join("bin/empathymachine");
+    let wrapper = root.join("empathymachine");
     ensure_wrapper_executable(&wrapper);
 
     let temp = tempdir().expect("tempdir");

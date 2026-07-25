@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Template: install_launchd.sh substitutes __PROJECT_ROOT__ and __HOME__
+         before copying to ~/Library/LaunchAgents/. Edit there for runtime tweaks. -->
+    <key>Label</key>
+    <string>com.giantravens.empathymachine</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_ROOT__/target/release/empathymachine</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_ROOT__</string>
+
+    <!-- RunAtLoad: start immediately when launchd loads the plist (login). -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- KeepAlive: restart on crash or non-zero exit, but not on clean exit
+         (so `launchctl stop` keeps it stopped until explicitly started). -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- Throttle restarts so a crash-loop doesn't burn CPU. -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/empathymachine.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/empathymachine.log</string>
+
+    <!-- Background process — lower scheduling priority than user interactive work. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
