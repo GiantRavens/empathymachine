@@ -14,3 +14,6 @@ certs/root_ca.pem
 # host os annoyances
 .DS_Store
 policy.yaml
+
+# Syncthing conflict artifacts — never track
+*.sync-conflict-*
