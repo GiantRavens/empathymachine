@@ -4,8 +4,8 @@
 Two-tier lookup:
   1. DuckDuckGo Tracker Radar (offline cache at ~/.empathymachine/tracker-radar/tds.json)
      — covers ~1k known trackers + ~5.5k domain→owner mappings.
-  2. LLM fallback (Anthropic Claude API via ANTHROPIC_API_KEY, or local
-     Ollama at 127.0.0.1:11434 if no API key) — for long-tail hosts DDG
+  2. LLM fallback (Claude on the subscription through the notebook's receipted
+     summons llm_receipt.run_claude, or local Ollama at 127.0.0.1:11434) — for long-tail hosts DDG
      doesn't classify (CDNs, niche services, recently-introduced hosts).
      Cached to ~/.empathymachine/host-cache.sqlite so repeat lookups are free.
 
@@ -32,7 +32,6 @@ import os
 import sqlite3
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -43,7 +42,7 @@ _DDG_URL = "https://staticcdn.duckduckgo.com/trackerblocking/v5/current/extensio
 _DDG_STALE_DAYS = 30
 _LLM_CACHE = _EM_HOME / "host-cache.sqlite"
 
-_ANTHROPIC_MODEL = "claude-haiku-4-5"
+_ANTHROPIC_MODEL = "haiku"
 _OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 _OLLAMA_MODEL = os.environ.get("EMPATHYMACHINE_OLLAMA_MODEL", "qwen3:8b")
 
@@ -211,40 +210,56 @@ def _cache_put(host: str, provider: str, result: dict) -> None:
         pass
 
 
-def call_anthropic(host: str) -> dict | None:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+def _llm_receipt():
+    """The notebook's receipted summons (code/forge/_shared/llm_receipt.py), or None.
+
+    Fleet rule (Staff Phase 1 slice 6): a Claude call leaves a cost receipt and runs on the
+    subscription, not a raw API key. Missing helper = no Claude tier; Ollama still answers."""
+    helper = (Path(os.environ.get("NOTEBOOK", str(Path.home() / "Desktop" / "notebook")))
+              / "code" / "forge" / "_shared" / "llm_receipt.py")
+    if not helper.is_file():
         return None
-    payload = {
-        "model": _ANTHROPIC_MODEL,
-        "max_tokens": 600,
-        "messages": [{"role": "user", "content": _LLM_PROMPT.format(host=host)}],
-    }
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
-    )
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("llm_receipt", helper)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def call_anthropic(host: str) -> dict | None:
+    lr = _llm_receipt()
+    if lr is None:
+        return None
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            resp = json.loads(r.read())
-        text = resp["content"][0]["text"].strip()
-        # Strip markdown fences if model added them
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip().rstrip("`").strip()
-        return json.loads(text)
-    except urllib.error.HTTPError as e:
-        sys.stderr.write(f"anthropic error {e.code}: {e.read().decode()[:200]}\n")
+        lr.NEUTRAL.mkdir(parents=True, exist_ok=True)
+        # lean, as llm_receipt.messages_create runs a plain-text request: no CLAUDE.md, memory,
+        # settings, MCP servers or tools (the bare CLI carried ~43K tokens of the notebook's context)
+        res = lr.run_claude(_LLM_PROMPT.format(host=host), caller="empathymachine.explain_host",
+                            purpose="explain-host", model=_ANTHROPIC_MODEL, timeout=45, cwd=lr.NEUTRAL,
+                            args=["--system-prompt", "Answer the request directly in text.",
+                                  "--setting-sources", "", "--strict-mcp-config", "--tools", ""])
     except Exception as e:
-        sys.stderr.write(f"anthropic call failed: {e}\n")
-    return None
+        sys.stderr.write(f"claude call failed: {e}\n")
+        return None
+    if res.returncode != 0 or not res.text:
+        sys.stderr.write(f"claude call failed: {(res.stderr or 'empty answer').strip()[:200]}\n")
+        return None
+    text = res.text.strip()
+    # Strip markdown fences if model added them
+    if text.startswith("```"):
+        text = text.split("```", 2)[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip().rstrip("`").strip()
+    try:
+        result = json.loads(text)
+    except ValueError as e:
+        sys.stderr.write(f"claude answer was not JSON: {e}\n")
+        return None
+    if not isinstance(result, dict):                  # llm_fallback stamps result["_cache"]
+        sys.stderr.write("claude answer was JSON but not an object\n")
+        return None
+    return result
 
 
 def call_ollama(host: str) -> dict | None:
@@ -382,7 +397,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sys.stderr.write(
         f"{host}: not in DDG and no LLM available\n"
-        f"  set ANTHROPIC_API_KEY or run a local Ollama with {_OLLAMA_MODEL} pulled\n"
+        f"  install the claude CLI (with the notebook synced) or run a local Ollama with {_OLLAMA_MODEL} pulled\n"
     )
     return 2
 

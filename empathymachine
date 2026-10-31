@@ -624,7 +624,7 @@ usage: empathymachine explain <host> [--json] [--no-llm]
        empathymachine explain --refresh-data
 
 Explains a hostname using the DuckDuckGo Tracker Radar dataset, with an
-optional LLM fallback (Anthropic API via ANTHROPIC_API_KEY, or local
+optional LLM fallback (Claude via the notebook's receipted summons, or local
 Ollama at 127.0.0.1:11434) for hosts DDG doesn't classify.
 
 First-time use auto-downloads the DDG dataset to ~/.empathymachine/.

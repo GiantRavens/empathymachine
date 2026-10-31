@@ -131,7 +131,7 @@ Tests: `cargo test --release` → 28 pass + 1 pre-existing `metrics::*` fail
 `scripts/explain_host.py` (and `mm explain <host>` / MCP `explain_host`).
 Two-tier lookup: DuckDuckGo Tracker Radar (offline, ~1.5 MB cached at
 `~/.empathymachine/tracker-radar/tds.json`, auto-refreshed if >30 days)
-+ LLM fallback (Anthropic API or local Ollama). LLM results cached in
++ LLM fallback (Claude via the notebook's receipted `llm_receipt.run_claude`, or local Ollama). LLM results cached in
 `~/.empathymachine/host-cache.sqlite`.
 
 Key implementation notes:

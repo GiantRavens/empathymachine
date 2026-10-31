@@ -269,8 +269,9 @@ break if you deny it. Two-tier lookup:
    third-party trackers + ~5.5k domain→owner mappings with prevalence,
    fingerprinting score, cookie behavior, and DDG's own block/ignore
    recommendation.
-2. **LLM fallback** for hosts DDG doesn't classify — prefers Anthropic
-   Claude API (set `ANTHROPIC_API_KEY`), falls back to local Ollama
+2. **LLM fallback** for hosts DDG doesn't classify — prefers Claude on the
+   subscription through the notebook's receipted summons
+   (`code/forge/_shared/llm_receipt.py`), falls back to local Ollama
    (`qwen3:8b` by default; override with `EMPATHYMACHINE_OLLAMA_MODEL`).
    Results cached in `~/.empathymachine/host-cache.sqlite` — repeat
    lookups are free.

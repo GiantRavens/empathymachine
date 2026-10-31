@@ -435,8 +435,8 @@ def explain_host(host: str, no_llm: bool = False) -> dict:
     """Look up a hostname's owner, tracker classification, and breakage impact.
 
     Two-tier lookup: DuckDuckGo Tracker Radar first (1k known trackers + 5.5k
-    domain→owner mappings), then LLM fallback (Anthropic Claude API or local
-    Ollama) for hosts DDG doesn't cover. Results from LLM are cached so repeat
+    domain→owner mappings), then LLM fallback (Claude on the subscription via the
+    notebook's receipted summons, or local Ollama) for hosts DDG doesn't cover. Results from LLM are cached so repeat
     lookups are free.
 
     Returns JSON with owner, category, prevalence, fingerprinting score,
